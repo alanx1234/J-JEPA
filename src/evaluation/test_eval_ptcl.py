@@ -1,0 +1,193 @@
+#!/bin/env python3.7
+
+import sys
+sys.path.insert(0, "../src")
+
+import os
+import argparse
+import numpy as np
+import tqdm
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.utils.data._utils.collate import default_collate
+from sklearn.metrics import accuracy_score
+from sklearn import metrics
+
+from src.models.jjepa import JJEPA
+from src.options import Options
+from src.dataset.ParticleDataset import ParticleDataset
+from src.evaluation.ClassificationHead import ClassificationHead
+
+torch.set_num_threads(2)
+
+
+def Projector(mlp, embedding):
+    mlp_spec = f"{embedding}-{mlp}"
+    layers = []
+    f = list(map(int, mlp_spec.split("-")))
+    for i in range(len(f) - 2):
+        layers.append(nn.Linear(f[i], f[i + 1]))
+        layers.append(nn.BatchNorm1d(f[i + 1]))
+        layers.append(nn.ReLU())
+    layers.append(nn.Linear(f[-2], f[-1], bias=False))
+    return nn.Sequential(*layers)
+
+
+def collate_drop_subjets(batch):
+    if isinstance(batch[0], (tuple, list)) and len(batch[0]) == 5:
+        batch = [(b[0], b[1], b[2], b[4]) for b in batch]
+    return default_collate(batch)
+
+
+def load_test_data(args, dataset_path):
+    dataset = ParticleDataset(
+        dataset_path,
+        return_labels=True,
+        num_jets=None,
+        compute_subjets=False,
+    )
+    stats = dataset.stats
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        collate_fn=collate_drop_subjets,
+        shuffle=False,
+    )
+    return dataloader, stats
+
+
+def find_nearest(array, value):
+    array = np.asarray(array)
+    idx = (np.abs(array - value)).argmin()
+    return array[idx]
+
+
+def get_perf_stats(labels, measures):
+    measures = np.nan_to_num(measures)
+    auc = metrics.roc_auc_score(labels, measures)
+    fpr, tpr, _ = metrics.roc_curve(labels, measures)
+    fpr2 = [fpr[i] for i in range(len(fpr)) if tpr[i] >= 0.5]
+    tpr2 = [tpr[i] for i in range(len(tpr)) if tpr[i] >= 0.5]
+    epsilon = 1e-8
+    try:
+        if len(tpr2) > 0 and len(fpr2) > 0:
+            nearest_tpr_idx = list(tpr2).index(find_nearest(list(tpr2), 0.5))
+            imtafe = np.nan_to_num(1 / (fpr2[nearest_tpr_idx] + epsilon))
+            if imtafe > 1e4:
+                imtafe = 1
+        else:
+            imtafe = 1
+    except (ValueError, IndexError):
+        imtafe = 1
+    return auc, imtafe
+
+
+def main(args):
+    options = Options.load(args.option_file)
+    args.use_parT = options.use_parT_encoder
+    args.output_dim = options.emb_dim
+
+    if args.flatten and not args.cls:
+        args.output_dim *= 128
+
+    world_size = torch.cuda.device_count()
+    if world_size:
+        device = torch.device("cuda:0")
+    else:
+        device = torch.device("cpu")
+    args.device = device
+
+    test_dataloader, test_stats = load_test_data(args, args.test_dataset_path)
+
+    model = JJEPA(options).to(args.device)
+    net = model.target_transformer
+
+    finetune_mlp_dim = args.output_dim
+    if args.finetune_mlp:
+        finetune_mlp_dim = f"{args.output_dim}-{args.finetune_mlp}"
+
+    if args.cls:
+        proj = ClassificationHead(finetune_mlp_dim).to(args.device)
+    else:
+        proj = Projector(2, finetune_mlp_dim).to(args.device)
+
+    checkpoint_path = os.path.join(args.out_dir, "last_checkpoint.pt")
+    checkpoint = torch.load(checkpoint_path, map_location=args.device)
+    net.load_state_dict(checkpoint["encoder"])
+    proj.load_state_dict(checkpoint["projector"])
+
+    loss = nn.CrossEntropyLoss(reduction="mean")
+    softmax = torch.nn.Softmax(dim=1)
+
+    losses_e = []
+    predicted_e = []
+    correct_e = []
+
+    net.eval()
+    with torch.no_grad():
+        proj.eval()
+        pbar = tqdm.tqdm(test_dataloader)
+        for i, (p4_spatial, p4, particle_mask, labels) in enumerate(pbar):
+            y = labels.to(args.device)
+            particle_mask = particle_mask.squeeze(-1).bool()
+            p4 = p4.to(dtype=torch.float32)
+            p4_spatial = p4_spatial.to(dtype=torch.float32)
+            p4 = p4.to(device, non_blocking=True)
+            p4_spatial = p4_spatial.to(device, non_blocking=True)
+            particle_mask = particle_mask.to(
+                device, non_blocking=True, dtype=torch.float32
+            )
+
+            if args.use_parT:
+                reps = net(
+                    p4, p4_spatial, particle_mask, split_mask=None, stats=test_stats
+                )
+            else:
+                reps = net(p4, particle_mask, split_mask=None, stats=test_stats)
+
+            if not args.cls:
+                if args.flatten:
+                    reps = reps.view(reps.shape[0], -1)
+                elif args.sum:
+                    reps = reps.sum(dim=1)
+                else:
+                    raise ValueError("No aggregation method specified")
+                out = proj(reps)
+            else:
+                out = proj(reps.transpose(0, 1), padding_mask=particle_mask == 0)
+
+            batch_loss = loss(out, y.long()).detach().cpu().item()
+            losses_e.append(batch_loss)
+            predicted_e.append(softmax(out).cpu().data.numpy())
+            correct_e.append(y.cpu().data)
+            pbar.set_description(f"test loss: {batch_loss}")
+
+    loss_test = float(np.mean(np.array(losses_e)))
+    predicted = np.concatenate(predicted_e)
+    target = np.concatenate(correct_e)
+
+    acc = accuracy_score(target, predicted[:, 1] > 0.5)
+    auc, imtafe = get_perf_stats(target, predicted[:, 1])
+
+    print("test loss:", loss_test)
+    print("test acc:", acc)
+    print("test auc:", auc)
+    print("test imtafe:", imtafe)
+
+    np.save(os.path.join(args.out_dir, "test_target_vals.npy"), target)
+    np.save(os.path.join(args.out_dir, "test_predicted_vals.npy"), predicted)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out-dir", type=str, required=True)
+    parser.add_argument("--option-file", type=str, required=True)
+    parser.add_argument("--test-dataset-path", type=str, required=True)
+    parser.add_argument("--finetune-mlp", type=str, default="")
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--flatten", type=int, default=0)
+    parser.add_argument("--sum", type=int, default=1)
+    parser.add_argument("--cls", type=int, default=0)
+    args = parser.parse_args()
+    main(args)
