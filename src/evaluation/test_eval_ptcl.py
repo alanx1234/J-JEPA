@@ -83,21 +83,7 @@ def get_perf_stats(labels, measures):
     return auc, imtafe
 
 
-def main(args):
-    options = Options.load(args.option_file)
-    args.use_parT = options.use_parT_encoder
-    args.output_dim = options.emb_dim
-
-    if args.flatten and not args.cls:
-        args.output_dim *= 128
-
-    world_size = torch.cuda.device_count()
-    if world_size:
-        device = torch.device("cuda:0")
-    else:
-        device = torch.device("cpu")
-    args.device = device
-
+def eval_single_trial(options, args, out_dir):
     test_dataloader, test_stats = load_test_data(args, args.test_dataset_path)
 
     model = JJEPA(options).to(args.device)
@@ -112,12 +98,12 @@ def main(args):
     else:
         proj = Projector(2, finetune_mlp_dim).to(args.device)
 
-    checkpoint_path = os.path.join(args.out_dir, "last_checkpoint.pt")
+    checkpoint_path = os.path.join(out_dir, "last_checkpoint.pt")
     checkpoint = torch.load(checkpoint_path, map_location=args.device)
     net.load_state_dict(checkpoint["encoder"])
     proj.load_state_dict(checkpoint["projector"])
 
-    loss = nn.CrossEntropyLoss(reduction="mean")
+    loss_fn = nn.CrossEntropyLoss(reduction="mean")
     softmax = torch.nn.Softmax(dim=1)
 
     losses_e = []
@@ -125,18 +111,18 @@ def main(args):
     correct_e = []
 
     net.eval()
+    proj.eval()
     with torch.no_grad():
-        proj.eval()
         pbar = tqdm.tqdm(test_dataloader)
         for i, (p4_spatial, p4, particle_mask, labels) in enumerate(pbar):
             y = labels.to(args.device)
             particle_mask = particle_mask.squeeze(-1).bool()
             p4 = p4.to(dtype=torch.float32)
             p4_spatial = p4_spatial.to(dtype=torch.float32)
-            p4 = p4.to(device, non_blocking=True)
-            p4_spatial = p4_spatial.to(device, non_blocking=True)
+            p4 = p4.to(args.device, non_blocking=True)
+            p4_spatial = p4_spatial.to(args.device, non_blocking=True)
             particle_mask = particle_mask.to(
-                device, non_blocking=True, dtype=torch.float32
+                args.device, non_blocking=True, dtype=torch.float32
             )
 
             if args.use_parT:
@@ -157,7 +143,7 @@ def main(args):
             else:
                 out = proj(reps.transpose(0, 1), padding_mask=particle_mask == 0)
 
-            batch_loss = loss(out, y.long()).detach().cpu().item()
+            batch_loss = loss_fn(out, y.long()).detach().cpu().item()
             losses_e.append(batch_loss)
             predicted_e.append(softmax(out).cpu().data.numpy())
             correct_e.append(y.cpu().data)
@@ -170,24 +156,79 @@ def main(args):
     acc = accuracy_score(target, predicted[:, 1] > 0.5)
     auc, imtafe = get_perf_stats(target, predicted[:, 1])
 
-    print("test loss:", loss_test)
-    print("test acc:", acc)
-    print("test auc:", auc)
-    print("test imtafe:", imtafe)
+    np.save(os.path.join(out_dir, "test_target_vals.npy"), target)
+    np.save(os.path.join(out_dir, "test_predicted_vals.npy"), predicted)
 
-    np.save(os.path.join(args.out_dir, "test_target_vals.npy"), target)
-    np.save(os.path.join(args.out_dir, "test_predicted_vals.npy"), predicted)
+    return loss_test, acc, auc, imtafe
+
+
+def main(args):
+    options = Options.load(args.option_file)
+    args.use_parT = options.use_parT_encoder
+    args.output_dim = options.emb_dim
+    if args.flatten and not args.cls:
+        args.output_dim *= 128
+
+    if torch.cuda.device_count():
+        args.device = torch.device("cuda:0")
+    else:
+        args.device = torch.device("cpu")
+
+    if args.parent_dir:
+        trial_dirs = [
+            os.path.join(args.parent_dir, d)
+            for d in sorted(os.listdir(args.parent_dir))
+            if d.startswith("trial-") and os.path.isdir(os.path.join(args.parent_dir, d))
+        ]
+        all_losses = []
+        all_accs = []
+        all_aucs = []
+        all_imtafes = []
+
+        for d in trial_dirs:
+            print("evaluating", d)
+            loss_test, acc, auc, imtafe = eval_single_trial(options, args, d)
+            print("trial:", d)
+            print("  test loss:", loss_test)
+            print("  test acc :", acc)
+            print("  test auc :", auc)
+            print("  test imtafe:", imtafe)
+            all_losses.append(loss_test)
+            all_accs.append(acc)
+            all_aucs.append(auc)
+            all_imtafes.append(imtafe)
+
+        losses = np.array(all_losses)
+        accs = np.array(all_accs)
+        aucs = np.array(all_aucs)
+        imtafes = np.array(all_imtafes)
+
+        print("summary over", len(trial_dirs), "trials")
+        print("loss   mean:", losses.mean(), "std:", losses.std(ddof=1))
+        print("acc    mean:", accs.mean(), "std:", accs.std(ddof=1))
+        print("auc    mean:", aucs.mean(), "std:", aucs.std(ddof=1))
+        print("imtafe mean:", imtafes.mean(), "std:", imtafes.std(ddof=1))
+
+    else:
+        if not args.out_dir:
+            raise ValueError("either --out-dir or --parent-dir must be specified")
+        loss_test, acc, auc, imtafe = eval_single_trial(options, args, args.out_dir)
+        print("test loss:", loss_test)
+        print("test acc :", acc)
+        print("test auc :", auc)
+        print("test imtafe:", imtafe)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--option-file", type=str, required=True)
     parser.add_argument("--test-dataset-path", type=str, required=True)
-    parser.add_argument("--finetune-mlp", type=str, default="")
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--finetune-mlp", type=str, default="")
     parser.add_argument("--flatten", type=int, default=0)
     parser.add_argument("--sum", type=int, default=1)
     parser.add_argument("--cls", type=int, default=0)
+    parser.add_argument("--out-dir", type=str, default="")
+    parser.add_argument("--parent-dir", type=str, default="")
     args = parser.parse_args()
     main(args)
