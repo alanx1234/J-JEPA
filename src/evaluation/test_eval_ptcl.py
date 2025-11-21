@@ -18,6 +18,7 @@ from src.models.jjepa import JJEPA
 from src.options import Options
 from src.dataset.ParticleDataset import ParticleDataset
 from src.evaluation.ClassificationHead import ClassificationHead
+import json
 
 torch.set_num_threads(2)
 
@@ -208,6 +209,39 @@ def main(args):
         print("acc    mean:", accs.mean(), "std:", accs.std(ddof=1))
         print("auc    mean:", aucs.mean(), "std:", aucs.std(ddof=1))
         print("imtafe mean:", imtafes.mean(), "std:", imtafes.std(ddof=1))
+
+        summary = {
+            "trials": [
+                {
+                    "trial": os.path.basename(d),
+                    "loss": float(l),
+                    "acc": float(a),
+                    "auc": float(au),
+                    "imtafe": float(im),
+                }
+                for d, l, a, au, im in zip(
+                    trial_dirs, losses, accs, aucs, imtafes
+                )
+            ],
+            "mean": {
+                "loss": float(losses.mean()),
+                "acc": float(accs.mean()),
+                "auc": float(aucs.mean()),
+                "imtafe": float(imtafes.mean()),
+            },
+            "std": {
+                "loss": float(losses.std(ddof=1)),
+                "acc": float(accs.std(ddof=1)),
+                "auc": float(aucs.std(ddof=1)),
+                "imtafe": float(imtafes.std(ddof=1)),
+            },
+        }
+
+        summary_path = os.path.join(args.parent_dir, "test_summary.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        print("wrote test summary to", summary_path)
+
 
     else:
         if not args.out_dir:
