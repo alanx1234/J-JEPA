@@ -182,8 +182,9 @@ def eval_single_trial(options, args, out_dir):
     acc = accuracy_score(target, predicted[:, 1] > 0.5)
     auc, imtafe = get_perf_stats(target, predicted[:, 1])
 
-    np.save(os.path.join(out_dir, "test_target_vals.npy"), target)
-    np.save(os.path.join(out_dir, "test_predicted_vals.npy"), predicted)
+    suffix = args.checkpoint_type if args.checkpoint_type else "last"
+    np.save(os.path.join(out_dir, f"test_target_vals_{suffix}.npy"), target)
+    np.save(os.path.join(out_dir, f"test_predicted_vals_{suffix}.npy"), predicted)
 
     return loss_test, acc, auc, imtafe
 
@@ -262,7 +263,8 @@ def main(args):
             },
         }
 
-        summary_path = os.path.join(args.parent_dir, "test_summary.json")
+        suffix = args.checkpoint_type if args.checkpoint_type else "last"
+        summary_path = os.path.join(args.parent_dir, f"test_summary_{suffix}.json")
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
         print("wrote test summary to", summary_path)
