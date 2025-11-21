@@ -56,7 +56,34 @@ def load_test_data(args, dataset_path):
         shuffle=False,
     )
     return dataloader, stats
+def load_checkpoint_weights(net, proj, out_dir, ckpt_type, device):
+    if ckpt_type == "last":
+        checkpoint_path = os.path.join(out_dir, "last_checkpoint.pt")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        net.load_state_dict(checkpoint["encoder"])
+        proj.load_state_dict(checkpoint["projector"])
+        return checkpoint_path
 
+    suffix_map = {
+        "best_acc": "acc",
+        "best_loss": "loss",
+        "best_rej": "rej",
+    }
+    if ckpt_type not in suffix_map:
+        raise ValueError(f"Unknown checkpoint type: {ckpt_type}")
+
+    suffix = suffix_map[ckpt_type]
+    enc_path = os.path.join(out_dir, f"jjepa_finetune_best_{suffix}.pt")
+    proj_path = os.path.join(out_dir, f"projector_finetune_best_{suffix}.pt")
+
+    if not os.path.isfile(enc_path):
+        raise FileNotFoundError(f"Encoder checkpoint not found: {enc_path}")
+    if not os.path.isfile(proj_path):
+        raise FileNotFoundError(f"Projector checkpoint not found: {proj_path}")
+
+    net.load_state_dict(torch.load(enc_path, map_location=device))
+    proj.load_state_dict(torch.load(proj_path, map_location=device))
+    return f"{enc_path} + {proj_path}"
 
 def find_nearest(array, value):
     array = np.asarray(array)
@@ -99,10 +126,8 @@ def eval_single_trial(options, args, out_dir):
     else:
         proj = Projector(2, finetune_mlp_dim).to(args.device)
 
-    checkpoint_path = os.path.join(out_dir, "last_checkpoint.pt")
-    checkpoint = torch.load(checkpoint_path, map_location=args.device)
-    net.load_state_dict(checkpoint["encoder"])
-    proj.load_state_dict(checkpoint["projector"])
+    src = load_checkpoint_weights(net, proj, out_dir, args.checkpoint_type, args.device)
+    print(f"loaded checkpoint from {src}")
 
     loss_fn = nn.CrossEntropyLoss(reduction="mean")
     softmax = torch.nn.Softmax(dim=1)
@@ -264,5 +289,6 @@ if __name__ == "__main__":
     parser.add_argument("--cls", type=int, default=0)
     parser.add_argument("--out-dir", type=str, default="")
     parser.add_argument("--parent-dir", type=str, default="")
+    parser.add_argument( "--checkpoint-type", type=str,default="last", choices=["last", "best_acc", "best_loss", "best_rej"])
     args = parser.parse_args()
     main(args)
