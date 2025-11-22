@@ -8,6 +8,9 @@ from functools import lru_cache
 
 from src.util.create_random_masks import get_subjets
 
+JETCLASS_QCD_IDX = 0
+JETCLASS_TBQQ_IDX = 8
+
 DataSample = namedtuple("DataSample", ["p4_spatial", "p4", "mask"])
 DataSample_label = namedtuple("DataSample_label", ["p4_spatial", "p4", "mask", "labels"])
 
@@ -43,8 +46,9 @@ class ParticleDataset(Dataset):
             raise ValueError(f"No HDF5 files in {directory_path!r}")
         with h5py.File(self.files[0], 'r') as f0:
             stats = {k: f0['stats'][k][:] for k in f0['stats']}
+
             if label_mode == "auto":
-                if "label_Tbqq" in f0 and "label_QCD" in f0:
+                if self.return_labels and "labels" in f0  and f0["labels"].ndim == 2 and f0["labels"].shape[1] == 10:
                     self.label_mode = "jetclass_top_vs_qcd"
                 else:
                     self.label_mode = "default"
@@ -54,13 +58,14 @@ class ParticleDataset(Dataset):
         self.mean_log_e, self.std_log_e = stats['part_e_log']
         self.stats = stats
         lengths = []
-        self.valid_indices_per_file = []  
+        self.valid_indices_per_file = []
 
         for fn in self.files:
             with h5py.File(fn, 'r') as f:
                 if self.label_mode == "jetclass_top_vs_qcd":
-                    tb  = f['label_Tbqq'][:]
-                    qcd = f['label_QCD'][:]
+                    labels = f["labels"][:]          # shape (N, 10)
+                    tb  = labels[:, JETCLASS_TBQQ_IDX]
+                    qcd = labels[:, JETCLASS_QCD_IDX]
 
                     valid = (tb == 1) | (qcd == 1)
                     idxs = np.nonzero(valid)[0].astype(np.int64)
@@ -102,9 +107,9 @@ class ParticleDataset(Dataset):
     def _estimate_size(self, path: str) -> int:
         with h5py.File(path, 'r') as f:
             if self.label_mode == "jetclass_top_vs_qcd":
-                n_jets = f['label_Tbqq'].shape[0]
+                n_jets = f['labels'].shape[0]
                 n_parts = f['mask'].shape[1]
-                bytes_labels = (n_jets * f['label_Tbqq'].dtype.itemsize if self.return_labels else 0)
+                bytes_labels = (n_jets * f['labels'].dtype.itemsize if self.return_labels else 0)
             else:
                 n_jets = f['labels'].shape[0]
                 n_parts = f['mask'].shape[1]
@@ -137,12 +142,13 @@ class ParticleDataset(Dataset):
                 labels_np = None
                 if self.return_labels:
                     if self.label_mode == "jetclass_top_vs_qcd":
-                        tb  = f['label_Tbqq'][idxs]
-                        qcd = f['label_QCD'][idxs]
-                        # 1 = top, 0 = QCD
+                        labels_all = f['labels'][idxs] if idxs is not None else f['labels'][:]
+                        tb  = labels_all[:, JETCLASS_TBQQ_IDX]
+                        qcd = labels_all[:, JETCLASS_QCD_IDX]
                         labels_np = np.where(tb == 1, 1, 0).astype(np.int64)
                     else:
                         labels_np = f['labels'][:]
+                        
             for k, arr in parts.items():
                 parts[k] = arr.astype(np.float32)
             mask_np = mask_np.astype(np.float32)
@@ -182,12 +188,14 @@ class ParticleDataset(Dataset):
 
             labels_np = None
             if self.return_labels:
-                if self.label_mode == "jetclass_top_vs_qcd":
-                    tb  = f['label_Tbqq'][idxs]
-                    qcd = f['label_QCD'][idxs]
-                    labels_np = np.where(tb == 1, 1, 0).astype(np.int64)
-                else:
-                    labels_np = f['labels'][:]
+                    if self.label_mode == "jetclass_top_vs_qcd":
+                        labels_all = f['labels'][idxs] if idxs is not None else f['labels'][:]
+                        tb  = labels_all[:, JETCLASS_TBQQ_IDX]
+                        qcd = labels_all[:, JETCLASS_QCD_IDX]
+                        labels_np = np.where(tb == 1, 1, 0).astype(np.int64)
+                    else:
+                        labels_np = f['labels'][:]
+                
         for k, arr in parts.items():
             parts[k] = arr.astype(np.float32)
         mask_np = mask_np.astype(np.float32)
@@ -248,9 +256,10 @@ class ParticleDataset(Dataset):
 
                 if self.return_labels:
                     if self.label_mode == "jetclass_top_vs_qcd":
-                        tb  = f['label_Tbqq'][true_idx]
-                        qcd = f['label_QCD'][true_idx]
-                        labels = 1 if tb == 1 else 0  
+                        vec = f['labels'][true_idx]           
+                        tb  = vec[JETCLASS_TBQQ_IDX]
+                        qcd = vec[JETCLASS_QCD_IDX]
+                        labels = 1 if tb == 1 else 0
                     else:
                         labels = f['labels'][true_idx]
                 else:
