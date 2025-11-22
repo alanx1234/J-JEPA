@@ -24,6 +24,7 @@ class ParticleDataset(Dataset):
         directory_path,
         num_jets=None,
         return_labels=False,
+        label_mode="auto", # which configuration to use
         cache_size_gb=0.0,
         size_multiplier=1.0,
         compute_subjets=False
@@ -31,6 +32,7 @@ class ParticleDataset(Dataset):
         self.return_labels = return_labels
         self.size_multiplier = size_multiplier
         self.compute_subjets = compute_subjets
+        self.label_mode = label_mode
         self.subjets_cache = {}
         self.files = sorted(
             os.path.join(directory_path, f)
@@ -41,26 +43,56 @@ class ParticleDataset(Dataset):
             raise ValueError(f"No HDF5 files in {directory_path!r}")
         with h5py.File(self.files[0], 'r') as f0:
             stats = {k: f0['stats'][k][:] for k in f0['stats']}
+            if label_mode == "auto":
+                if "label_Tbqq" in f0 and "label_QCD" in f0:
+                    self.label_mode = "jetclass_top_vs_qcd"
+                else:
+                    self.label_mode = "default"
+            else:
+                self.label_mode = label_mode
+
         self.mean_log_e, self.std_log_e = stats['part_e_log']
         self.stats = stats
         lengths = []
+        self.valid_indices_per_file = []  
+
         for fn in self.files:
             with h5py.File(fn, 'r') as f:
-                lengths.append(int(f['labels'].shape[0]))
-        if num_jets is not None and num_jets < sum(lengths):
-            capped, total = [], 0
-            for fn, L in zip(self.files, lengths):
-                if total + L < num_jets:
-                    capped.append(L)
-                    total += L
+                if self.label_mode == "jetclass_top_vs_qcd":
+                    tb  = f['label_Tbqq'][:]
+                    qcd = f['label_QCD'][:]
+
+                    valid = (tb == 1) | (qcd == 1)
+                    idxs = np.nonzero(valid)[0].astype(np.int64)
+                    self.valid_indices_per_file.append(idxs)
+                    lengths.append(len(idxs))
                 else:
-                    capped.append(num_jets - total)
+                    L = int(f['labels'].shape[0])
+                    self.valid_indices_per_file.append(None)
+                    lengths.append(L)
+        if num_jets is not None and num_jets < sum(lengths):
+            capped_lengths = []
+            capped_valid_indices = []
+            total = 0
+
+            for fn, L, idxs in zip(self.files, lengths, self.valid_indices_per_file):
+                if total >= num_jets:
                     break
-            lengths = capped
+                take = min(L, num_jets - total)
+                capped_lengths.append(take)
+                if idxs is not None:
+                    capped_valid_indices.append(idxs[:take])
+                else:
+                    capped_valid_indices.append(None)
+                total += take
+
+            lengths = capped_lengths
             self.files = self.files[:len(lengths)]
+            self.valid_indices_per_file = capped_valid_indices
         self.file_lengths = np.array(lengths, dtype=int)
         self.cum_lengths = np.concatenate([[0], np.cumsum(self.file_lengths)])
         self._total = int(self.cum_lengths[-1])
+        self.file_to_index = {fn: i for i, fn in enumerate(self.files)}
         self.cache_size_bytes = int(cache_size_gb * 1024**3)
         self.content_cache = {}
         self.total_cached = 0
@@ -69,11 +101,19 @@ class ParticleDataset(Dataset):
 
     def _estimate_size(self, path: str) -> int:
         with h5py.File(path, 'r') as f:
-            n_jets, n_parts = f['labels'].shape[0], f['mask'].shape[1]
+            if self.label_mode == "jetclass_top_vs_qcd":
+                n_jets = f['label_Tbqq'].shape[0]
+                n_parts = f['mask'].shape[1]
+                bytes_labels = (n_jets * f['label_Tbqq'].dtype.itemsize if self.return_labels else 0)
+            else:
+                n_jets = f['labels'].shape[0]
+                n_parts = f['mask'].shape[1]
+                bytes_labels = (n_jets * f['labels'].dtype.itemsize if self.return_labels else 0)
+
             bytes_p4_spatial = n_jets * n_parts * 4 * 4
             bytes_p4         = n_jets * n_parts * 4 * 4
             bytes_mask       = n_jets * n_parts * 1 * 4
-            bytes_labels     = n_jets * f['labels'].dtype.itemsize
+
         return int((bytes_p4_spatial + bytes_p4 + bytes_mask + bytes_labels) * self.size_multiplier)
 
     def _preload_content(self):
@@ -82,9 +122,27 @@ class ParticleDataset(Dataset):
             if self.total_cached + est > self.cache_size_bytes:
                 break
             with h5py.File(fn, 'r') as f:
-                parts = {k: f['particles'][k][:] for k in f['particles']}
-                mask_np = f['mask'][:]
-                labels_np = f['labels'][:] if self.return_labels else None
+                idxs = None
+                if self.label_mode == "jetclass_top_vs_qcd":
+                    file_idx = self.file_to_index[fn]
+                    idxs = self.valid_indices_per_file[file_idx]
+
+                if idxs is None:
+                    parts = {k: f['particles'][k][:] for k in f['particles']}
+                    mask_np = f['mask'][:]
+                else:
+                    parts = {k: f['particles'][k][idxs] for k in f['particles']}
+                    mask_np = f['mask'][idxs]
+
+                labels_np = None
+                if self.return_labels:
+                    if self.label_mode == "jetclass_top_vs_qcd":
+                        tb  = f['label_Tbqq'][idxs]
+                        qcd = f['label_QCD'][idxs]
+                        # 1 = top, 0 = QCD
+                        labels_np = np.where(tb == 1, 1, 0).astype(np.int64)
+                    else:
+                        labels_np = f['labels'][:]
             for k, arr in parts.items():
                 parts[k] = arr.astype(np.float32)
             mask_np = mask_np.astype(np.float32)
@@ -110,9 +168,26 @@ class ParticleDataset(Dataset):
         if fn in self.content_cache:
             return
         with h5py.File(fn, 'r') as f:
-            parts = {k: f['particles'][k][:] for k in f['particles']}
-            mask_np = f['mask'][:]
-            labels_np = f['labels'][:] if self.return_labels else None
+            idxs = None
+            if self.label_mode == "jetclass_top_vs_qcd":
+                file_idx = self.file_to_index[fn]
+                idxs = self.valid_indices_per_file[file_idx]
+
+            if idxs is None:
+                parts = {k: f['particles'][k][:] for k in f['particles']}
+                mask_np = f['mask'][:]
+            else:
+                parts = {k: f['particles'][k][idxs] for k in f['particles']}
+                mask_np = f['mask'][idxs]
+
+            labels_np = None
+            if self.return_labels:
+                if self.label_mode == "jetclass_top_vs_qcd":
+                    tb  = f['label_Tbqq'][idxs]
+                    qcd = f['label_QCD'][idxs]
+                    labels_np = np.where(tb == 1, 1, 0).astype(np.int64)
+                else:
+                    labels_np = f['labels'][:]
         for k, arr in parts.items():
             parts[k] = arr.astype(np.float32)
         mask_np = mask_np.astype(np.float32)
@@ -142,6 +217,10 @@ class ParticleDataset(Dataset):
         file_idx = int(np.searchsorted(self.cum_lengths, idx, side='right') - 1)
         local_idx = int(idx - self.cum_lengths[file_idx])
         fn = self.files[file_idx]
+
+        true_idx = local_idx
+        if self.label_mode == "jetclass_top_vs_qcd":
+            true_idx = int(self.valid_indices_per_file[file_idx][local_idx])
         if fn in self.content_cache:
             d = self.content_cache[fn]
             p_spatial = d['p4_spatial'][local_idx]
@@ -158,15 +237,24 @@ class ParticleDataset(Dataset):
                 labels    = d['labels'][local_idx] if self.return_labels else None
             else:
                 f = self._get_file_handle(fn)
-                px = f['particles']['part_px'][local_idx].astype(np.float32)
-                py = f['particles']['part_py'][local_idx].astype(np.float32)
-                pz = f['particles']['part_pz'][local_idx].astype(np.float32)
-                deta = f['particles']['part_deta'][local_idx].astype(np.float32)
-                dphi = f['particles']['part_dphi'][local_idx].astype(np.float32)
-                ptl = f['particles']['part_pt_log'][local_idx].astype(np.float32)
-                elog = f['particles']['part_e_log'][local_idx].astype(np.float32)
-                mask_np = f['mask'][local_idx].astype(np.float32)
-                labels = f['labels'][local_idx] if self.return_labels else None
+                px   = f['particles']['part_px'][true_idx].astype(np.float32)
+                py   = f['particles']['part_py'][true_idx].astype(np.float32)
+                pz   = f['particles']['part_pz'][true_idx].astype(np.float32)
+                deta = f['particles']['part_deta'][true_idx].astype(np.float32)
+                dphi = f['particles']['part_dphi'][true_idx].astype(np.float32)
+                ptl  = f['particles']['part_pt_log'][true_idx].astype(np.float32)
+                elog = f['particles']['part_e_log'][true_idx].astype(np.float32)
+                mask_np = f['mask'][true_idx].astype(np.float32)
+
+                if self.return_labels:
+                    if self.label_mode == "jetclass_top_vs_qcd":
+                        tb  = f['label_Tbqq'][true_idx]
+                        qcd = f['label_QCD'][true_idx]
+                        labels = 1 if tb == 1 else 0  
+                    else:
+                        labels = f['labels'][true_idx]
+                else:
+                    labels = None
                 log_e = elog * self.std_log_e + self.mean_log_e
                 norm_e = (np.exp(log_e) * mask_np).astype(np.float32)
                 p_spatial = torch.from_numpy(np.stack([px, py, pz, norm_e], axis=-1))
