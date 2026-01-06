@@ -23,10 +23,10 @@ from src.dataset.ParticleDataset import ParticleDataset
 torch.set_num_threads(2)
 
 
-def collate_drop_subjets(batch):
-    if isinstance(batch[0], (tuple, list)) and len(batch[0]) == 5:
-        batch = [(b[0], b[1], b[2], b[3]) for b in batch]
-    return default_collate(batch)
+def collate_ptcl_keep_subjets_last(batch):
+    tensors = default_collate([b[:-1] for b in batch])  # includes labels if present
+    subjets = [b[-1] for b in batch]                    # keep python list
+    return (*tensors, subjets)
 
 
 def load_split(dataset_path, batch_size, num_workers):
@@ -34,13 +34,13 @@ def load_split(dataset_path, batch_size, num_workers):
         dataset_path,
         return_labels=True,
         num_jets=None,
-        compute_subjets=False,
+        compute_subjets=True,
     )
     stats = dataset.stats
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        collate_fn=collate_drop_subjets,
+        collate_fn=collate_ptcl_keep_subjets_last,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
@@ -59,8 +59,10 @@ def get_perf_stats(labels, measures):
     measures = np.nan_to_num(measures)
     auc = metrics.roc_auc_score(labels, measures)
     fpr, tpr, _ = metrics.roc_curve(labels, measures)
+
     fpr2 = [fpr[i] for i in range(len(fpr)) if tpr[i] >= 0.5]
     tpr2 = [tpr[i] for i in range(len(tpr)) if tpr[i] >= 0.5]
+
     epsilon = 1e-8
     try:
         if len(tpr2) > 0 and len(fpr2) > 0:
@@ -72,6 +74,7 @@ def get_perf_stats(labels, measures):
             imtafe = 1
     except (ValueError, IndexError):
         imtafe = 1
+
     return float(auc), float(imtafe)
 
 
@@ -84,11 +87,21 @@ def extract_epoch(path):
 def embed_split(net, args, loader, stats):
     zs, ys = [], []
     net.eval()
-    for (p4_spatial, p4, particle_mask, labels) in tqdm.tqdm(loader, leave=False):
+
+    for batch in tqdm.tqdm(loader, leave=False):
+        if len(batch) == 5:
+            p4_spatial, p4, particle_mask, labels, _subjets = batch
+        elif len(batch) == 4:
+            p4_spatial, p4, particle_mask, labels = batch
+        else:
+            raise ValueError(f"Unexpected batch length {len(batch)}; expected 4 or 5")
+
         y = labels.to(args.device)
         particle_mask = particle_mask.squeeze(-1).bool()
+
         p4 = p4.to(dtype=torch.float32)
         p4_spatial = p4_spatial.to(dtype=torch.float32)
+
         p4 = p4.to(args.device, non_blocking=True)
         p4_spatial = p4_spatial.to(args.device, non_blocking=True)
         particle_mask = particle_mask.to(args.device, non_blocking=True, dtype=torch.float32)
@@ -110,6 +123,13 @@ def embed_split(net, args, loader, stats):
 
     Z = torch.cat(zs, dim=0).numpy()
     Y = torch.cat(ys, dim=0).numpy()
+
+    # Ensure binary labels {0,1} if dataset uses other conventions
+    uniq = np.unique(Y)
+    if len(uniq) == 2 and not np.array_equal(uniq, np.array([0, 1])):
+        mapping = {int(uniq[0]): 0, int(uniq[1]): 1}
+        Y = np.vectorize(lambda v: mapping[int(v)])(Y).astype(np.int64)
+
     return Z, Y
 
 
@@ -173,7 +193,10 @@ def main(args):
     if not ckpts:
         raise FileNotFoundError("No checkpoint_epoch_*.pth found in ckpt directory")
 
-    os.makedirs(os.path.dirname(args.out_csv), exist_ok=True)
+    out_dir = os.path.dirname(args.out_csv)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     with open(args.out_csv, "w") as f:
         f.write("epoch,acc,auc,imtafe,ckpt\n")
 
