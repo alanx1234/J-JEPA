@@ -644,13 +644,17 @@ def main(rank, world_size, args):
                     if options.use_amp:
                         scaler.scale(loss).backward()
                         scaler.unscale_(optimizer)
+
                         if options.max_grad_norm > 0:
                             torch.nn.utils.clip_grad_norm_(model.parameters(), options.max_grad_norm)
 
                         prev_scale = scaler.get_scale()
-                        scaler.step(optimizer)   # may be skipped if grads overflow
+                        scaler.step(optimizer)
                         scaler.update()
-                        did_step = (scaler.get_scale() == prev_scale)
+                        did_step = scaler.get_scale() == prev_scale
+
+                        if did_step:
+                            scheduler.step()
                     else:
                         loss.backward()
                         if options.max_grad_norm > 0:
@@ -658,16 +662,14 @@ def main(rank, world_size, args):
                         optimizer.step()
                         did_step = True
 
-                    if did_step:
-                        scheduler.step()
-
                     with torch.no_grad():
-                        m = next(momentum_scheduler)
-                        for param_q, param_k in zip(
-                            unwrap(model).context_transformer.parameters(),
-                            unwrap(model).target_transformer.parameters(),
-                        ):
-                            param_k.data.mul_(m).add_((1.0 - m) * param_q.detach().data)
+                        if did_step:
+                            m = next(momentum_scheduler)
+                            for param_q, param_k in zip(
+                                unwrap(model).context_transformer.parameters(),
+                                unwrap(model).target_transformer.parameters(),
+                            ):
+                                param_k.data.mul_(m).add_((1.0 - m) * param_q.detach().data)
 
                 loss_dict = {
                     "total_loss": float(loss),
