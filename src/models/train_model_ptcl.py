@@ -651,7 +651,7 @@ def main(rank, world_size, args):
                         prev_scale = scaler.get_scale()
                         scaler.step(optimizer)
                         scaler.update()
-                        did_step = scaler.get_scale() == prev_scale
+                        did_step = scaler.get_scale() >= prev_scale
 
                         if did_step:
                             scheduler.step()
