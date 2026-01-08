@@ -14,6 +14,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel
 from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import Subset
 from torch.utils.data._utils.collate import default_collate
 import torch.distributed as dist
 import time
@@ -88,6 +89,12 @@ def parse_args():
         default=0.99,
         help="base momentum for momentum scheduler",
     )
+    parser.add_argument("--probe", action="store_true", help="Enable linear probe")
+    parser.add_argument("--probe_every", type=int, default=1, help="run probe every N epochs")
+    parser.add_argument("--probe_train_jets", type=int, default=50_000)
+    parser.add_argument("--probe_val_jets", type=int, default=50_000)
+    parser.add_argument("--probe_steps", type=int, default=200, help="SGD steps per probe run")
+    parser.add_argument("--probe_lr", type=float, default=1e-2)
     return parser.parse_args()
 
 
@@ -131,6 +138,14 @@ def collate_fn(batch):
     tensors = default_collate([b[:-1] for b in batch])
     subjets = [b[-1] for b in batch]
     return (*tensors, subjets)
+
+def collate_probe_fn(batch):
+    p_spatial = default_collate([b[0] for b in batch])
+    p4        = default_collate([b[1] for b in batch])
+    mask      = default_collate([b[2] for b in batch])
+    subjets   = [b[3] for b in batch]
+    labels    = default_collate([b[4] for b in batch])
+    return p_spatial, p4, mask, subjets, labels
 
 def ddp_setup_if_needed():
     if "LOCAL_RANK" in os.environ:
@@ -238,6 +253,20 @@ def log_gpu_stats(device):
         logger.info(f"GPU Memory Allocated: {memory_allocated:.2f} GB")
         logger.info(f"GPU Memory Reserved:  {memory_reserved:.2f} GB")
 
+def make_fixed_subset(n, total, seed=123):
+    rng = np.random.RandomState(seed)
+    idxs = rng.choice(total, size=min(n, total), replace=False)
+    return idxs.tolist()
+
+@torch.no_grad()
+def encode_batch(encoder, p4, p4_spatial, particle_mask, stats, use_parT: bool):
+    if use_parT:
+        reps = encoder(p4, p4_spatial, particle_mask, split_mask=None, stats=stats)  # [B, N, D]
+    else:
+        reps = encoder(p4, particle_mask, split_mask=None, stats=stats)              # [B, N, D]
+
+    z = reps.mean(dim=1)  # [B, D]
+    return z
 
 def main(rank, world_size, args):
     torch.cuda.set_device(rank)
@@ -373,6 +402,109 @@ def main(rank, world_size, args):
     )
     logger.info(f"Train dataset size: {train_dataset_size}")
     logger.info(f"Val dataset size:   {val_dataset_size}")
+
+        
+    if args.probe and rank == 0:
+        probe_train_ds = ParticleDataset(
+            args.data_path,  
+            num_jets=args.probe_train_jets,   
+            compute_subjets=True,
+            return_labels=True,
+            label_mode="jetclass_top_vs_qcd",
+        )
+
+        probe_val_path = args.data_path.replace("train", "val")
+        probe_val_ds = ParticleDataset(
+            probe_val_path,
+            num_jets=args.probe_val_jets,
+            compute_subjets=True,
+            return_labels=True,
+            label_mode="jetclass_top_vs_qcd",
+        )
+
+        train_idxs = make_fixed_subset(args.probe_train_jets, len(probe_train_ds), seed=123)
+        val_idxs   = make_fixed_subset(args.probe_val_jets,   len(probe_val_ds),   seed=456)
+
+        probe_train_loader = DataLoader(
+            Subset(probe_train_ds, train_idxs),
+            batch_size=options.batch_size,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=collate_probe_fn,
+        )
+
+        probe_val_loader = DataLoader(
+            Subset(probe_val_ds, val_idxs),
+            batch_size=options.batch_size,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=collate_probe_fn,
+        )
+        def run_probe(epoch: int) -> float:
+            enc = unwrap(model).target_transformer
+            enc.eval()
+
+            D = options.emb_dim
+            probe_head = nn.Linear(D, 2).to(device)
+            probe_opt  = optim.SGD(probe_head.parameters(), lr=args.probe_lr, momentum=0.9)
+            probe_ce   = nn.CrossEntropyLoss()
+
+            probe_head.train()
+            step = 0
+            for (p4_spatial, p4, particle_mask, subjets, labels) in probe_train_loader:
+                p4 = p4.to(device, non_blocking=True).float()
+                p4_spatial = p4_spatial.to(device, non_blocking=True).float()
+                particle_mask = particle_mask.squeeze(-1).to(device, non_blocking=True).float()
+                y = labels.to(device, non_blocking=True).long()
+
+                with torch.no_grad():
+                    z = encode_batch(
+                        enc,
+                        p4=p4,
+                        p4_spatial=p4_spatial,
+                        particle_mask=particle_mask,
+                        stats=train_stats,
+                        use_parT=options.use_parT_encoder,
+                    )  # [B, D]
+
+                logits = probe_head(z)     # [B, 2]
+                loss = probe_ce(logits, y)
+
+                probe_opt.zero_grad(set_to_none=True)
+                loss.backward()
+                probe_opt.step()
+
+                step += 1
+                if step >= args.probe_steps:
+                    break
+
+            probe_head.eval()
+            correct, total = 0, 0
+            with torch.no_grad():
+                for (p4_spatial, p4, particle_mask, subjets, labels) in probe_val_loader:
+                    p4 = p4.to(device, non_blocking=True).float()
+                    p4_spatial = p4_spatial.to(device, non_blocking=True).float()
+                    particle_mask = particle_mask.squeeze(-1).to(device, non_blocking=True).float()
+                    y = labels.to(device, non_blocking=True).long()
+
+                    z = encode_batch(
+                        enc,
+                        p4=p4,
+                        p4_spatial=p4_spatial,
+                        particle_mask=particle_mask,
+                        stats=val_stats,
+                        use_parT=options.use_parT_encoder,
+                    )  # [B, D]
+
+                    pred = probe_head(z).argmax(dim=1)
+                    correct += (pred == y).sum().item()
+                    total += y.numel()
+
+            acc = correct / max(total, 1)
+            logger.info(f"[probe] epoch={epoch+1} acc={acc:.4f}")
+            return acc
 
     losses_train, mse_losses_train, var_losses_train, cov_losses_train = [], [], [], []
     losses_val,   mse_losses_val,   var_losses_val,   cov_losses_val   = [], [], [], []
@@ -635,7 +767,7 @@ def main(rank, world_size, args):
         model.train()
         scheduler.step()
 
-        if rank == 0 and epoch % options.checkpoint_freq == 0:
+        if rank == 0 and (epoch % options.checkpoint_freq == 0):
             save_checkpoint(
                 unwrap(model),
                 optimizer,
@@ -645,20 +777,21 @@ def main(rank, world_size, args):
                 args.output_dir,
             )
 
-        losses_train.append(loss_meter_train.avg)
-        mse_losses_train.append(mse_loss_meter_train.avg)
-        if options.cov_loss_weight > 0:
-            cov_losses_train.append(cov_loss_meter_train.avg)
-        if options.var_loss_weight > 0:
-            var_losses_train.append(var_loss_meter_train.avg)
-        losses_val.append(loss_meter_val.avg)
-        mse_losses_val.append(mse_loss_meter_val.avg)
-        if options.cov_loss_weight > 0:
-            cov_losses_val.append(cov_loss_meter_val.avg)
-        if options.var_loss_weight > 0:
-            var_losses_val.append(var_loss_meter_val.avg)
-
         if rank == 0:
+            losses_train.append(loss_meter_train.avg)
+            mse_losses_train.append(mse_loss_meter_train.avg)
+            if options.cov_loss_weight > 0:
+                cov_losses_train.append(cov_loss_meter_train.avg)
+            if options.var_loss_weight > 0:
+                var_losses_train.append(var_loss_meter_train.avg)
+
+            losses_val.append(loss_meter_val.avg)
+            mse_losses_val.append(mse_loss_meter_val.avg)
+            if options.cov_loss_weight > 0:
+                cov_losses_val.append(cov_loss_meter_val.avg)
+            if options.var_loss_weight > 0:
+                var_losses_val.append(var_loss_meter_val.avg)
+
             if loss_meter_val.avg < lowest_val_loss:
                 logger.info(f"new lowest val loss: {loss_meter_val.avg:.3f}")
                 logger.info("Saving best model")
@@ -667,6 +800,7 @@ def main(rank, world_size, args):
                     unwrap(model).state_dict(),
                     os.path.join(args.output_dir, "best_model.pth"),
                 )
+
             np.save(os.path.join(args.output_dir, "train_losses.npy"), losses_train)
             np.save(os.path.join(args.output_dir, "val_losses.npy"), losses_val)
             np.save(os.path.join(args.output_dir, "train_mse_losses.npy"), mse_losses_train)
@@ -677,6 +811,13 @@ def main(rank, world_size, args):
             if options.var_loss_weight > 0:
                 np.save(os.path.join(args.output_dir, "train_var_losses.npy"), var_losses_train)
                 np.save(os.path.join(args.output_dir, "val_var_losses.npy"), var_losses_val)
+
+            if args.probe and ((epoch + 1) % args.probe_every == 0):
+                probe_acc = run_probe(epoch)
+                with open(os.path.join(args.output_dir, "probe_log.txt"), "a") as f:
+                    f.write(f"{epoch+1}\t{probe_acc:.6f}\n")
+
+
 
         epoch_end_time = time.time()
         if rank == 0:
