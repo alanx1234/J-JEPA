@@ -99,6 +99,12 @@ class ParticleDataset(Dataset):
             lengths = capped_lengths
             self.files = self.files[:len(lengths)]
             self.valid_indices_per_file = capped_valid_indices
+        if self.label_mode == "jetclass_top_vs_qcd":
+            total = int(np.sum(lengths))
+            per_file_nonzero = sum(int(l > 0) for l in lengths)
+            print(f"[ParticleDataset] jetclass_top_vs_qcd enabled")
+            print(f"[ParticleDataset] total kept jets = {total}")
+            print(f"[ParticleDataset] files with >=1 kept jet = {per_file_nonzero}/{len(lengths)}")
         self.file_lengths = np.array(lengths, dtype=int)
         self.cum_lengths = np.concatenate([[0], np.cumsum(self.file_lengths)])
         self._total = int(self.cum_lengths[-1])
