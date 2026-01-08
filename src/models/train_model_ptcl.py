@@ -258,6 +258,13 @@ def make_fixed_subset(n, total, seed=123):
     idxs = rng.choice(total, size=min(n, total), replace=False)
     return idxs.tolist()
 
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
 @torch.no_grad()
 def encode_batch(encoder, p4, p4_spatial, particle_mask, stats, use_parT: bool):
     if use_parT:
@@ -391,6 +398,7 @@ def main(rank, world_size, args):
     if world_size > 1:
         model = DistributedDataParallel(model, device_ids=[rank])
 
+    seed_everything(seed + rank) 
 
     scaler = GradScaler()
 
