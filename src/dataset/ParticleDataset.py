@@ -17,7 +17,7 @@ DataSample_label = namedtuple("DataSample_label", ["p4_spatial", "p4", "mask", "
 class ParticleDataset(Dataset):
     """
     description:
-        this version of ParticleDataset contains the following features:
+        ParticleDataset contains the following optimizations:
             - Content cache:  preloads small files into CPU RAM up to cache_size_gb
             - LRU file cache: keeps up to 8 HDF5 files open to avoid reopening
             - For uncached files: reads only the single requested jet 
@@ -35,7 +35,6 @@ class ParticleDataset(Dataset):
         self.return_labels = return_labels
         self.size_multiplier = size_multiplier
         self.compute_subjets = compute_subjets
-        self.label_mode = label_mode
         self.subjets_cache = {}
         self.files = sorted(
             os.path.join(directory_path, f)
@@ -48,10 +47,10 @@ class ParticleDataset(Dataset):
             stats = {k: f0['stats'][k][:] for k in f0['stats']}
 
             if label_mode == "auto":
-                if self.return_labels and "labels" in f0  and f0["labels"].ndim == 2 and f0["labels"].shape[1] == 10:
+                if "JetClass" in str(directory_path): # pretraining on only Top + QCD jets
                     self.label_mode = "jetclass_top_vs_qcd"
                 else:
-                    self.label_mode = "default"
+                    self.label_mode = "synthetic_bkg_vs_sig"
             else:
                 self.label_mode = label_mode
 
@@ -109,11 +108,12 @@ class ParticleDataset(Dataset):
             if self.label_mode == "jetclass_top_vs_qcd":
                 n_jets = f['labels'].shape[0]
                 n_parts = f['mask'].shape[1]
-                bytes_labels = (n_jets * f['labels'].dtype.itemsize if self.return_labels else 0)
+                bytes_labels = (n_jets * f['labels'].shape[1] * f['labels'].dtype.itemsize) if self.return_labels else 0
+
             else:
                 n_jets = f['labels'].shape[0]
                 n_parts = f['mask'].shape[1]
-                bytes_labels = (n_jets * f['labels'].dtype.itemsize if self.return_labels else 0)
+                bytes_labels = (n_jets * f['labels'].shape[1] * f['labels'].dtype.itemsize) if self.return_labels else 0
 
             bytes_p4_spatial = n_jets * n_parts * 4 * 4
             bytes_p4         = n_jets * n_parts * 4 * 4
@@ -159,7 +159,7 @@ class ParticleDataset(Dataset):
             p4_spatial = torch.from_numpy(p4_spatial_np)
             p4         = torch.from_numpy(p4_np)
             mask       = torch.from_numpy(mask_np).unsqueeze(-1)
-            labels     = torch.from_numpy(labels_np) if self.return_labels else None
+            labels = torch.from_numpy(labels_np).long() if (self.return_labels and labels_np is not None) else None
             data = {'p4_spatial': p4_spatial, 'p4': p4, 'mask': mask, 'labels': labels}
             actual = sum(t.element_size() * t.numel() for t in data.values() if t is not None)
             self.content_cache[fn] = data
@@ -188,13 +188,13 @@ class ParticleDataset(Dataset):
 
             labels_np = None
             if self.return_labels:
-                    if self.label_mode == "jetclass_top_vs_qcd":
-                        labels_all = f['labels'][idxs] if idxs is not None else f['labels'][:]
-                        tb  = labels_all[:, JETCLASS_TBQQ_IDX]
-                        qcd = labels_all[:, JETCLASS_QCD_IDX]
-                        labels_np = np.where(tb == 1, 1, 0).astype(np.int64)
-                    else:
-                        labels_np = f['labels'][:]
+                if self.label_mode == "jetclass_top_vs_qcd":
+                    labels_all = f['labels'][idxs] if idxs is not None else f['labels'][:]
+                    tb  = labels_all[:, JETCLASS_TBQQ_IDX]
+                    qcd = labels_all[:, JETCLASS_QCD_IDX]
+                    labels_np = np.where(tb == 1, 1, 0).astype(np.int64)
+                else:
+                    labels_np = f['labels'][:]
                 
         for k, arr in parts.items():
             parts[k] = arr.astype(np.float32)
@@ -206,7 +206,7 @@ class ParticleDataset(Dataset):
         p4_spatial = torch.from_numpy(p4_spatial_np)
         p4         = torch.from_numpy(p4_np)
         mask       = torch.from_numpy(mask_np).unsqueeze(-1)
-        labels     = torch.from_numpy(labels_np) if self.return_labels else None
+        labels = torch.from_numpy(labels_np).long() if (self.return_labels and labels_np is not None) else None
         data = {'p4_spatial': p4_spatial, 'p4': p4, 'mask': mask, 'labels': labels}
         need = sum(t.element_size() * t.numel() for t in data.values() if t is not None)
         while self._cache_order and self.total_cached + need > self.cache_size_bytes:
@@ -259,9 +259,9 @@ class ParticleDataset(Dataset):
                         vec = f['labels'][true_idx]           
                         tb  = vec[JETCLASS_TBQQ_IDX]
                         qcd = vec[JETCLASS_QCD_IDX]
-                        labels = 1 if tb == 1 else 0
+                        labels = torch.tensor(1 if tb == 1 else 0, dtype=torch.long)
                     else:
-                        labels = f['labels'][true_idx]
+                        labels = torch.from_numpy(f['labels'][true_idx]).long()
                 else:
                     labels = None
                 log_e = elog * self.std_log_e + self.mean_log_e
