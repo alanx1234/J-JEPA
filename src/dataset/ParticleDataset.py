@@ -150,7 +150,6 @@ class ParticleDataset(Dataset):
         self.file_lengths = self._base_file_lengths[perm]
 
         self._rebuild_indexing()
-        self._clear_epoch_dependent_caches()
         try:
             self._get_file_handle.cache_clear()
         except Exception:
@@ -326,16 +325,16 @@ class ParticleDataset(Dataset):
         p4_tensor = p4_tensor * p_mask
         subjets_info_sorted = None
         if self.compute_subjets:
-            if idx not in self.subjets_cache:
+            cache_key = (fn, true_idx)   
+            if cache_key not in self.subjets_cache:
                 valid = p_mask.squeeze(-1).bool().numpy()
                 arr   = p_spatial[valid].numpy()
                 if arr.size == 0:
-                    self.subjets_cache[idx] = None
+                    self.subjets_cache[cache_key] = None
                 else:
                     px, py, pz, e = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
-                    subjets = get_subjets(px, py, pz, e, JET_ALGO="CA", jet_radius=0.2)
-                    self.subjets_cache[idx] = subjets
-            subjets_info_sorted = self.subjets_cache[idx]
+                    self.subjets_cache[cache_key] = get_subjets(px, py, pz, e, JET_ALGO="CA", jet_radius=0.2)
+            subjets_info_sorted = self.subjets_cache[cache_key]
         if self.return_labels:
             return p_spatial, p4_tensor, p_mask, subjets_info_sorted, labels
         return p_spatial, p4_tensor, p_mask, subjets_info_sorted
