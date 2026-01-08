@@ -125,7 +125,7 @@ def setup_data_loader(args, options, data_path, world_size, rank, tag="train"):
     loader = DataLoader(
         dataset,
         batch_size=options.batch_size,
-        shuffle=False,
+        shuffle=shuffle,
         num_workers=2,
         pin_memory=True,
         sampler=sampler,
@@ -295,7 +295,6 @@ def main(rank, world_size, args):
 
     options = Options.load(args.config)
     options.batch_size = args.batch_size
-    options.num_steps_per_epoch = math.ceil(args.num_jets / (args.batch_size * world_size)) # match DDP for EMA updates
     options.cov_loss_weight = args.cov_loss_weight
     options.var_loss_weight = args.var_loss_weight
     options.base_momentum = args.base_momentum
@@ -402,14 +401,14 @@ def main(rank, world_size, args):
 
     scaler = GradScaler()
 
-    momentum_scheduler = create_momentum_scheduler(options)
-
     train_loader, train_sampler, train_dataset_size, train_stats = setup_data_loader(
         args, options, args.data_path, world_size, rank, tag="train"
     )
     val_loader, val_sampler, val_dataset_size, val_stats = setup_data_loader(
         args, options, args.data_path, world_size, rank, tag="val"
     )
+    options.num_steps_per_epoch = len(train_loader)
+    momentum_scheduler = create_momentum_scheduler(options)
     steps_per_epoch = options.num_steps_per_epoch  
     total_steps = options.num_epochs * steps_per_epoch
 
@@ -552,7 +551,7 @@ def main(rank, world_size, args):
         time_meter_train = AverageMeter()
         time_meter_val = AverageMeter()
 
-        steps_train = math.ceil(train_dataset_size / (options.batch_size * world_size))
+        steps_train = len(train_loader)
         pbar_t = tqdm(
             train_loader,
             total=steps_train,
@@ -651,7 +650,7 @@ def main(rank, world_size, args):
                         prev_scale = scaler.get_scale()
                         scaler.step(optimizer)
                         scaler.update()
-                        did_step = scaler.get_scale() >= prev_scale
+                        did_step = scaler.get_scale() == prev_scale
 
                         if did_step:
                             scheduler.step()
@@ -701,7 +700,7 @@ def main(rank, world_size, args):
         train_time_end = time.time()
         
 
-        steps_val = math.ceil(val_dataset_size / (options.batch_size * world_size))
+        steps_val   = len(val_loader)
         pbar_v = tqdm(
             val_loader,
             total=steps_val,
