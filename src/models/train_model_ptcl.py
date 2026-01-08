@@ -293,6 +293,8 @@ def main(rank, world_size, args):
     options.var_loss_weight = args.var_loss_weight
     options.base_momentum = args.base_momentum
     options.encoder_pos_emb = False
+    options.num_jets = args.num_jets
+    options.num_val_jets = args.num_val_jets
 
     setup_logging(rank, args.output_dir)
     logger.info(f"Initialized (rank/world-size) {rank}/{world_size}")
@@ -389,7 +391,7 @@ def main(rank, world_size, args):
     if world_size > 1:
         model = DistributedDataParallel(model, device_ids=[rank])
 
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=options.num_epochs)
+
     scaler = GradScaler()
 
     momentum_scheduler = create_momentum_scheduler(options)
@@ -399,6 +401,16 @@ def main(rank, world_size, args):
     )
     val_loader, val_sampler, val_dataset_size, val_stats = setup_data_loader(
         args, options, args.data_path, world_size, rank, tag="val"
+    )
+    steps_per_epoch = options.num_steps_per_epoch  
+    total_steps = options.num_epochs * steps_per_epoch
+
+    start_global_step = options.start_epochs * steps_per_epoch
+
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps,
+        last_epoch=start_global_step - 1
     )
     logger.info(f"Train dataset size: {train_dataset_size}")
     logger.info(f"Val dataset size:   {val_dataset_size}")
@@ -587,7 +599,7 @@ def main(rank, world_size, args):
             def train_step():
                 cov_l = 0
                 var_l = 0
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 with autocast(enabled=options.use_amp):
                     B = p4_spatial.shape[0]
                     N_ctxt = context_masks.sum(dim=1).max().item()
@@ -618,18 +630,27 @@ def main(rank, world_size, args):
                                      variance_loss(masked_context_reps, ctxt_particle_mask)) / 2
                             loss += options.var_loss_weight * var_l
 
+                    did_step = False
+
                     if options.use_amp:
                         scaler.scale(loss).backward()
                         scaler.unscale_(optimizer)
                         if options.max_grad_norm > 0:
                             torch.nn.utils.clip_grad_norm_(model.parameters(), options.max_grad_norm)
-                        scaler.step(optimizer)
+
+                        prev_scale = scaler.get_scale()
+                        scaler.step(optimizer)   # may be skipped if grads overflow
                         scaler.update()
+                        did_step = (scaler.get_scale() == prev_scale)
                     else:
                         loss.backward()
                         if options.max_grad_norm > 0:
                             torch.nn.utils.clip_grad_norm_(model.parameters(), options.max_grad_norm)
                         optimizer.step()
+                        did_step = True
+
+                    if did_step:
+                        scheduler.step()
 
                     with torch.no_grad():
                         m = next(momentum_scheduler)
@@ -663,6 +684,7 @@ def main(rank, world_size, args):
             if rank == 0 and itr % options.log_freq == 0:
                 logger.info(f"[{epoch + 1}, {itr}] total training loss: {loss_meter_train.avg:.3f}, ({time_meter_train.avg:.1f} ms)")
                 logger.info(f"mse loss: {mse_loss_meter_train.avg:+.3f}, cov loss: {cov_loss_meter_train.avg:+.3f}, var loss: {var_loss_meter_train.avg:+.3f}")
+                logger.info(f"lr(step) = {scheduler.get_last_lr()[0]:.6e}")
                 log_gpu_stats(device)
 
         train_time_end = time.time()
@@ -765,7 +787,6 @@ def main(rank, world_size, args):
                 log_gpu_stats(device)
 
         model.train()
-        scheduler.step()
 
         if rank == 0 and (epoch % options.checkpoint_freq == 0):
             save_checkpoint(
