@@ -44,7 +44,7 @@ torch.manual_seed(seed)
 np.random.seed(seed)
 random.seed(seed)
 
-torch.autograd.set_detect_anomaly(True)
+torch.autograd.set_detect_anomaly(False)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train JJEPA model")
@@ -536,7 +536,7 @@ def main(rank, world_size, args):
 
         if train_sampler:
             train_sampler.set_epoch(epoch)
-        train_loader.dataset.set_epoch(epoch + 1000 * rank)
+        train_loader.dataset.set_epoch(epoch)
         if val_sampler:
             val_sampler.set_epoch(epoch)
 
@@ -650,7 +650,7 @@ def main(rank, world_size, args):
                         prev_scale = scaler.get_scale()
                         scaler.step(optimizer)
                         scaler.update()
-                        did_step = scaler.get_scale() == prev_scale
+                        did_step = scaler.get_scale() >= prev_scale
 
                         if did_step:
                             scheduler.step()
