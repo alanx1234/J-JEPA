@@ -30,12 +30,17 @@ class ParticleDataset(Dataset):
         label_mode="auto", # which configuration to use
         cache_size_gb=0.0,
         size_multiplier=1.0,
-        compute_subjets=False
+        compute_subjets=False,
+        base_seed=42,
+        shuffle_files_each_epoch=True
     ):
         self.return_labels = return_labels
         self.size_multiplier = size_multiplier
         self.compute_subjets = compute_subjets
         self.subjets_cache = {}
+        self.base_seed = int(base_seed)
+        self.shuffle_files_each_epoch = bool(shuffle_files_each_epoch)
+        self.epoch = 0
         self.files = sorted(
             os.path.join(directory_path, f)
             for f in os.listdir(directory_path)
@@ -74,6 +79,7 @@ class ParticleDataset(Dataset):
                     L = int(f['labels'].shape[0])
                     self.valid_indices_per_file.append(None)
                     lengths.append(L)
+
         if num_jets is not None and num_jets < sum(lengths):
             capped_lengths = []
             capped_valid_indices = []
@@ -97,12 +103,53 @@ class ParticleDataset(Dataset):
         self.cum_lengths = np.concatenate([[0], np.cumsum(self.file_lengths)])
         self._total = int(self.cum_lengths[-1])
         self.file_to_index = {fn: i for i, fn in enumerate(self.files)}
+
+        self._base_files = list(self.files)
+        self._base_valid_indices_per_file = list(self.valid_indices_per_file)
+        self._base_file_lengths = self.file_lengths.copy()
+
         self.cache_size_bytes = int(cache_size_gb * 1024**3)
         self.content_cache = {}
         self.total_cached = 0
         self._cache_order = []
+        self.set_epoch(0)
         self._preload_content()
 
+    def _rebuild_indexing(self):
+        self.file_lengths = np.array(self.file_lengths, dtype=int)
+        self.cum_lengths = np.concatenate([[0], np.cumsum(self.file_lengths)])
+        self._total = int(self.cum_lengths[-1])
+        self.file_to_index = {fn: i for i, fn in enumerate(self.files)}
+
+    def _clear_epoch_dependent_caches(self):
+        self.subjets_cache = {}
+
+    def close(self):
+        try:
+            self._get_file_handle.cache_clear()
+        except Exception:
+            pass
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+        if not self.shuffle_files_each_epoch:
+            return
+
+        rng = np.random.RandomState(self.base_seed + self.epoch)
+        perm = rng.permutation(len(self._base_files))
+
+        # permute all per-file aligned structures together
+        self.files = [self._base_files[i] for i in perm]
+        self.valid_indices_per_file = [self._base_valid_indices_per_file[i] for i in perm]
+        self.file_lengths = self._base_file_lengths[perm]
+
+        self._rebuild_indexing()
+        self._clear_epoch_dependent_caches()
+        try:
+            self._get_file_handle.cache_clear()
+        except Exception:
+            pass
+            
     def _estimate_size(self, path: str) -> int:
         with h5py.File(path, 'r') as f:
             if self.label_mode == "jetclass_top_vs_qcd":

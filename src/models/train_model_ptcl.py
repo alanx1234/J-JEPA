@@ -109,9 +109,9 @@ def setup_environment(rank):
 def setup_data_loader(args, options, data_path, world_size, rank, tag="train"):
     if tag == "val":
         data_path = data_path.replace("train", "val")
-        dataset = ParticleDataset(data_path, num_jets=options.num_val_jets, compute_subjets = True)
+        dataset = ParticleDataset(data_path, num_jets=options.num_val_jets, compute_subjets = True, shuffle_files_each_epoch = False)
     else:
-        dataset = ParticleDataset(data_path, num_jets=options.num_jets, compute_subjets = True)
+        dataset = ParticleDataset(data_path, num_jets=options.num_jets, compute_subjets = True, shuffle_files_each_epoch=True)
 
     sampler = None
     if world_size > 1:
@@ -537,6 +537,7 @@ def main(rank, world_size, args):
 
         if train_sampler:
             train_sampler.set_epoch(epoch)
+        train_loader.dataset.set_epoch(epoch + 1000 * rank)
         if val_sampler:
             val_sampler.set_epoch(epoch)
 
