@@ -30,6 +30,9 @@ from src.util.create_random_masks import create_random_masks
 from src.util.cov_loss import covariance_loss
 from src.util.var_loss import variance_loss
 
+from sklearn import metrics
+from sklearn.metrics import accuracy_score
+
 import math
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -96,7 +99,35 @@ def parse_args():
     parser.add_argument("--probe_steps", type=int, default=200, help="SGD steps per probe run")
     parser.add_argument("--probe_lr", type=float, default=1e-2)
     return parser.parse_args()
+def find_nearest(array, value):
+    array = np.asarray(array)
+    idx = (np.abs(array - value)).argmin()
+    return array[idx]
 
+def get_perf_stats(labels, measures):
+    measures = np.nan_to_num(measures)  # Replace NaNs with 0
+    auc = metrics.roc_auc_score(labels, measures)
+    fpr, tpr, _ = metrics.roc_curve(labels, measures)
+
+    # Only keep fpr/tpr where tpr >= 0.5
+    fpr2 = [fpr[i] for i in range(len(fpr)) if tpr[i] >= 0.5]
+    tpr2 = [tpr[i] for i in range(len(tpr)) if tpr[i] >= 0.5]
+
+    epsilon = 1e-8  # Small value to avoid division by zero or very small numbers
+
+    # Calculate IMTAFE, handle edge cases
+    try:
+        if len(tpr2) > 0 and len(fpr2) > 0:
+            nearest_tpr_idx = list(tpr2).index(find_nearest(list(tpr2), 0.5))
+            imtafe = np.nan_to_num(1 / (fpr2[nearest_tpr_idx] + epsilon))
+            if imtafe > 1e4:  # something went wrong
+                imtafe = 1
+        else:
+            imtafe = 1  # Default value if tpr2 or fpr2 are empty
+    except (ValueError, IndexError):  # Handle cases where index is not found
+        imtafe = 1
+
+    return auc, imtafe
 
 def setup_environment(rank):
     os.environ["MASTER_ADDR"] = "localhost"
@@ -499,8 +530,12 @@ def main(rank, world_size, args):
                 if step >= args.probe_steps:
                     break
 
+            softmax = torch.nn.Softmax(dim=1)
+
             probe_head.eval()
-            correct, total = 0, 0
+            predicted_e = []
+            correct_e = []
+
             with torch.no_grad():
                 for (p4_spatial, p4, particle_mask, subjets, labels) in probe_val_loader:
                     p4 = p4.to(device, non_blocking=True).float()
@@ -517,13 +552,18 @@ def main(rank, world_size, args):
                         use_parT=options.use_parT_encoder,
                     )  # [B, D]
 
-                    pred = probe_head(z).argmax(dim=1)
-                    correct += (pred == y).sum().item()
-                    total += y.numel()
+                    logits = probe_head(z)  # [B, 2]
+                    predicted_e.append(softmax(logits).detach().cpu().numpy())
+                    correct_e.append(y.detach().cpu().numpy())
 
-            acc = correct / max(total, 1)
-            logger.info(f"[probe] epoch={epoch+1} acc={acc:.4f}")
-            return acc
+            predicted = np.concatenate(predicted_e, axis=0)
+            target = np.concatenate(correct_e, axis=0)
+
+            acc = accuracy_score(target, predicted[:, 1] > 0.5)
+            auc, imtafe = get_perf_stats(target, predicted[:, 1])
+
+            logger.info(f"[probe] epoch={epoch+1} acc={acc:.4f} auc={auc:.4f} imtafe={imtafe:.2f}")
+            return acc, auc, imtafe
 
     losses_train, mse_losses_train, var_losses_train, cov_losses_train = [], [], [], []
     losses_val,   mse_losses_val,   var_losses_val,   cov_losses_val   = [], [], [], []
@@ -844,9 +884,15 @@ def main(rank, world_size, args):
                 np.save(os.path.join(args.output_dir, "val_var_losses.npy"), var_losses_val)
 
             if args.probe and ((epoch + 1) % args.probe_every == 0):
-                probe_acc = run_probe(epoch)
-                with open(os.path.join(args.output_dir, "probe_log.txt"), "a") as f:
-                    f.write(f"{epoch+1}\t{probe_acc:.6f}\n")
+                probe_acc, probe_auc, probe_imtafe = run_probe(epoch)
+
+                probe_path = os.path.join(args.output_dir, "probe_log.txt")
+                new_file = not os.path.exists(probe_path)
+
+                with open(probe_path, "a") as f:
+                    if new_file:
+                        f.write("epoch\tacc\tauc\timtafe\n")
+                    f.write(f"{epoch+1}\t{probe_acc:.6f}\t{probe_auc:.6f}\t{probe_imtafe:.6f}\n")
 
 
 
