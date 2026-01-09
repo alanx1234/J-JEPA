@@ -427,7 +427,7 @@ def main(rank, world_size, args):
         probe_train_ds = ParticleDataset(
             args.data_path,  
             num_jets=args.probe_train_jets,   
-            compute_subjets=True,
+            compute_subjets=False,
             return_labels=True,
             label_mode="jetclass_top_vs_qcd",
         )
@@ -436,7 +436,7 @@ def main(rank, world_size, args):
         probe_val_ds = ParticleDataset(
             probe_val_path,
             num_jets=args.probe_val_jets,
-            compute_subjets=True,
+            compute_subjets=False,
             return_labels=True,
             label_mode="jetclass_top_vs_qcd",
         )
