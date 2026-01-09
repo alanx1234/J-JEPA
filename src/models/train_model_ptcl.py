@@ -111,7 +111,7 @@ def setup_data_loader(args, options, data_path, world_size, rank, tag="train"):
         data_path = data_path.replace("train", "val")
         dataset = ParticleDataset(data_path, num_jets=options.num_val_jets, compute_subjets = True, shuffle_files_each_epoch = False)
     else:
-        dataset = ParticleDataset(data_path, num_jets=options.num_jets, compute_subjets = True, shuffle_files_each_epoch=False)
+        dataset = ParticleDataset(data_path, num_jets=options.num_jets, compute_subjets = True, shuffle_files_each_epoch=True)
 
     sampler = None
     if world_size > 1:
@@ -125,7 +125,7 @@ def setup_data_loader(args, options, data_path, world_size, rank, tag="train"):
     loader = DataLoader(
         dataset,
         batch_size=options.batch_size,
-        shuffle=shuffle,
+        shuffle=False,
         num_workers=2,
         pin_memory=True,
         sampler=sampler,
