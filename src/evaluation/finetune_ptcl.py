@@ -132,7 +132,35 @@ def get_perf_stats(labels, measures):
         imtafe = 1
 
     return auc, imtafe
+class EarlyStopper:
+    def __init__(self, mode: str, patience: int, min_delta: float = 0.0, warmup: int = 0):
+        assert mode in ("min", "max")
+        self.mode = mode
+        self.patience = int(patience)
+        self.min_delta = float(min_delta)
+        self.warmup = int(warmup)
 
+        self.best = None
+        self.bad_epochs = 0
+
+    def _improved(self, value: float) -> bool:
+        if self.best is None:
+            return True
+        if self.mode == "min":
+            return value < (self.best - self.min_delta)
+        return value > (self.best + self.min_delta)
+
+    def step(self, value: float, epoch: int) -> bool:
+        if self._improved(value):
+            self.best = value
+            self.bad_epochs = 0
+            return False if epoch < self.warmup else False
+
+        if epoch < self.warmup:
+            return False
+
+        self.bad_epochs += 1
+        return self.bad_epochs >= self.patience
 
 def get_unique_dir(base_dir):
     """Get a unique directory using file locking to prevent race conditions"""
@@ -286,6 +314,20 @@ def main(args):
     l_val_best = 99999
     acc_val_best = 0
     rej_val_best = 0
+
+    if args.es_metric == "loss":
+        es_mode = "min"
+    else:
+        es_mode = "max"
+
+    early_stopper = EarlyStopper(
+        mode=es_mode,
+        patience=args.es_patience,
+        min_delta=args.es_min_delta,
+        warmup=args.es_warmup,
+    )
+
+
     # Load the checkpoint
     if args.from_checkpoint:
         # Load state dictionaries
@@ -298,6 +340,13 @@ def main(args):
         l_val_best = checkpoint["val loss"]
         acc_val_best = checkpoint["val acc"]
         rej_val_best = checkpoint["val rej"]
+
+        if args.es_metric == "loss":
+            early_stopper.best = l_val_best
+        elif args.es_metric == "acc":
+            early_stopper.best = acc_val_best
+        elif args.es_metric == "rej":
+            early_stopper.best = rej_val_best
 
     softmax = torch.nn.Softmax(dim=1)
     loss_train_all = []
@@ -633,6 +682,37 @@ if __name__ == "__main__":
         dest="num_samples",
         default=1_000_000,
         help="number of jets for training",
+    )
+    parser.add_argument(
+        "--early-stop",
+        type=int,
+        default=0,
+        help="enable early stopping (1) or disable (0)."
+    )
+    parser.add_argument(
+        "--es-metric",
+        type=str,
+        default="loss",
+        choices=["loss", "acc", "rej"],
+        help="metric to monitor for early stopping: val loss / val acc / val rej (IMTAFE)."
+    )
+    parser.add_argument(
+        "--es-patience",
+        type=int,
+        default=30,
+        help="stop after this many epochs with no improvement."
+    )
+    parser.add_argument(
+        "--es-min-delta",
+        type=float,
+        default=0.0,
+        help="minimum improvement to reset patience."
+    )
+    parser.add_argument(
+        "--es-warmup",
+        type=int,
+        default=50,
+        help="do not early-stop before this epoch index."
     )
 
     args = parser.parse_args()
