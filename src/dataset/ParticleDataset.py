@@ -174,6 +174,8 @@ class ParticleDataset(Dataset):
         return int((bytes_p4_spatial + bytes_p4 + bytes_mask + bytes_labels) * self.size_multiplier)
 
     def _preload_content(self):
+        if self.cache_size_bytes <= 0:
+            return
         for fn in sorted(self.files, key=self._estimate_size):
             est = self._estimate_size(fn)
             if self.total_cached + est > self.cache_size_bytes:
@@ -223,6 +225,8 @@ class ParticleDataset(Dataset):
         return h5py.File(fn, 'r', rdcc_nbytes=512*1024**2, rdcc_nslots=1_000_000, rdcc_w0=0.9)
 
     def _prefetch_file(self, fn: str):
+        if self.cache_size_bytes <= 0:
+            return
         if fn in self.content_cache:
             return
         with h5py.File(fn, 'r') as f:
@@ -288,7 +292,8 @@ class ParticleDataset(Dataset):
             p_mask    = d['mask'][local_idx]
             labels    = d['labels'][local_idx] if self.return_labels else None
         else:
-            self._prefetch_file(fn)
+            if self.cache_size_bytes > 0:
+                self._prefetch_file(fn)
             if fn in self.content_cache:
                 d = self.content_cache[fn]
                 p_spatial = d['p4_spatial'][local_idx]
