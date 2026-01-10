@@ -154,8 +154,8 @@ class EarlyStopper:
         if self._improved(value):
             self.best = value
             self.bad_epochs = 0
-            return False if epoch < self.warmup else False
-
+            return False
+        
         if epoch < self.warmup:
             return False
 
@@ -531,7 +531,7 @@ def main(args):
             np.save(
                 f"{out_dir}/validation_predicted_vals_rej.npy",
                 predicted,
-            )
+            )   
 
         # save all losses and accuracies
         np.save(
@@ -546,6 +546,52 @@ def main(args):
             f"{out_dir}/acc_val.npy",
             np.array(acc_val_all),
         )
+
+        if args.early_stop:
+            if args.es_metric == "loss":
+                monitor_val = float(loss_val_all[-1])
+            elif args.es_metric == "acc":
+                monitor_val = float(acc_val_all[-1])
+            else:  # "rej"
+                monitor_val = float(imtafe)
+
+            should_stop = early_stopper.step(monitor_val, epoch)
+
+            print(
+                f"[ES] metric={args.es_metric} value={monitor_val:.6g} "
+                f"best={early_stopper.best:.6g} bad_epochs={early_stopper.bad_epochs}/{args.es_patience} "
+                f"warmup={args.es_warmup}",
+                flush=True,
+                file=logfile,
+            )
+
+            if should_stop:
+                print(
+                    f"[ES] Early stopping triggered at epoch {epoch}.",
+                    flush=True,
+                    file=logfile,
+                )
+                save_dict = {
+                    "encoder": net.state_dict(),
+                    "projector": proj.state_dict(),
+                    "opt": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "val loss": loss_val_all[-1],
+                    "val acc": acc_val_all[-1],
+                    "val rej": imtafe,
+                }
+                torch.save(save_dict, f"{out_dir}/last_checkpoint.pt")
+                # Write a small marker file (useful for batch jobs)
+                with open(os.path.join(out_dir, "stopped_early.txt"), "w") as f:
+                    f.write(
+                        f"stopped_epoch={epoch}\n"
+                        f"metric={args.es_metric}\n"
+                        f"best={early_stopper.best}\n"
+                        f"patience={args.es_patience}\n"
+                        f"min_delta={args.es_min_delta}\n"
+                        f"warmup={args.es_warmup}\n"
+                    )
+                break
         te_end = time.time()
         print(
             f"epoch {epoch} done in {round(te_end - te_start, 1)} seconds",
@@ -563,7 +609,22 @@ def main(args):
             "val rej": imtafe,
         }
         torch.save(save_dict, f"{out_dir}/last_checkpoint.pt")
-
+    try:
+        import json
+        summary = {
+            "early_stop": int(args.early_stop),
+            "es_metric": args.es_metric,
+            "es_patience": int(args.es_patience),
+            "es_min_delta": float(args.es_min_delta),
+            "es_warmup": int(args.es_warmup),
+            "epochs_ran": int(len(loss_train_all)),
+            "best_val_loss": float(np.min(loss_val_all)) if len(loss_val_all) else None,
+            "best_val_acc": float(np.max(acc_val_all)) if len(acc_val_all) else None,
+        }
+        with open(os.path.join(out_dir, "final_summary.json"), "w") as f:
+            json.dump(summary, f, indent=2)
+    except Exception as e:
+        print(f"Failed to write final_summary.json: {e}", flush=True, file=logfile)
     # Training done
     print("Training done", flush=True, file=logfile)
 
@@ -686,7 +747,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--early-stop",
         type=int,
-        default=0,
+        default=1,
         help="enable early stopping (1) or disable (0)."
     )
     parser.add_argument(
