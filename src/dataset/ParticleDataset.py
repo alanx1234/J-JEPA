@@ -138,9 +138,14 @@ class ParticleDataset(Dataset):
 
     def set_epoch(self, epoch: int):
         self.epoch = int(epoch)
-        if not self.shuffle_files_each_epoch:
-            return
 
+        if not self.shuffle_files_each_epoch:
+            # ensure canonical ordering
+            self.files = list(self._base_files)
+            self.valid_indices_per_file = list(self._base_valid_indices_per_file)
+            self.file_lengths = self._base_file_lengths.copy()
+            self._rebuild_indexing()
+            return
         rng = np.random.RandomState(self.base_seed + self.epoch)
         perm = rng.permutation(len(self._base_files))
 
@@ -157,21 +162,26 @@ class ParticleDataset(Dataset):
             
     def _estimate_size(self, path: str) -> int:
         with h5py.File(path, 'r') as f:
+            n_parts = f['mask'].shape[1]
             if self.label_mode == "jetclass_top_vs_qcd":
-                n_jets = f['labels'].shape[0]
-                n_parts = f['mask'].shape[1]
-                bytes_labels = (n_jets * f['labels'].shape[1] * f['labels'].dtype.itemsize) if self.return_labels else 0
-
+                file_idx = self.file_to_index[path]
+                idxs = self.valid_indices_per_file[file_idx]
+                n_jets = len(idxs) if idxs is not None else int(f['labels'].shape[0])
             else:
-                n_jets = f['labels'].shape[0]
-                n_parts = f['mask'].shape[1]
-                bytes_labels = (n_jets * f['labels'].shape[1] * f['labels'].dtype.itemsize) if self.return_labels else 0
+                n_jets = int(f['labels'].shape[0])
 
+            if self.return_labels:
+                if self.label_mode == "jetclass_top_vs_qcd":
+                    bytes_labels = n_jets * np.dtype(np.int64).itemsize
+                else:
+                    bytes_labels = f['labels'].size * f['labels'].dtype.itemsize
+            else:
+                bytes_labels = 0
             bytes_p4_spatial = n_jets * n_parts * 4 * 4
             bytes_p4         = n_jets * n_parts * 4 * 4
             bytes_mask       = n_jets * n_parts * 1 * 4
-
         return int((bytes_p4_spatial + bytes_p4 + bytes_mask + bytes_labels) * self.size_multiplier)
+
 
     def _preload_content(self):
         if self.cache_size_bytes <= 0:
@@ -292,7 +302,7 @@ class ParticleDataset(Dataset):
             p_mask    = d['mask'][local_idx]
             labels    = d['labels'][local_idx] if self.return_labels else None
         else:
-            if self.cache_size_bytes > 0:
+            if self.cache_size_bytes > 0 and len(self.files) > 1:
                 self._prefetch_file(fn)
             if fn in self.content_cache:
                 d = self.content_cache[fn]
