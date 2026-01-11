@@ -178,6 +178,38 @@ def collate_probe_fn(batch):
     labels    = default_collate([b[4] for b in batch])
     return p_spatial, p4, mask, subjets, labels
 
+
+def make_stratified_subset(ds, n_total, seed=123):
+    n_pos = n_total // 2
+    n_neg = n_total - n_pos
+    rng = np.random.RandomState(seed)
+
+    pos, neg = [], []
+    seen = set()
+    tries = 0
+    max_tries = 2_000_000
+
+    while (len(pos) < n_pos or len(neg) < n_neg) and tries < max_tries:
+        i = int(rng.randint(0, len(ds)))
+        tries += 1
+        if i in seen:
+            continue
+        seen.add(i)
+
+        *_, y = ds[i]
+        y = int(y)
+        if y == 1 and len(pos) < n_pos:
+            pos.append(i)
+        elif y == 0 and len(neg) < n_neg:
+            neg.append(i)
+
+    if len(pos) < n_pos or len(neg) < n_neg:
+        raise RuntimeError(f"Could not stratify: pos={len(pos)} neg={len(neg)} (len(ds)={len(ds)})")
+
+    idxs = pos + neg
+    rng.shuffle(idxs)
+    return idxs
+
 def ddp_setup_if_needed():
     if "LOCAL_RANK" in os.environ:
         local_rank = int(os.environ["LOCAL_RANK"])
@@ -456,24 +488,29 @@ def main(rank, world_size, args):
         
     if args.probe and rank == 0:
         probe_train_ds = ParticleDataset(
-            args.data_path,  
-            num_jets=args.probe_train_jets,   
+            args.data_path,
+            num_jets=None,
             compute_subjets=False,
             return_labels=True,
             label_mode="jetclass_top_vs_qcd",
+            shuffle_files_each_epoch=False,
         )
 
         probe_val_path = args.data_path.replace("train", "val")
         probe_val_ds = ParticleDataset(
             probe_val_path,
-            num_jets=args.probe_val_jets,
+            num_jets=None,
             compute_subjets=False,
             return_labels=True,
             label_mode="jetclass_top_vs_qcd",
+            shuffle_files_each_epoch=False,
         )
 
-        train_idxs = make_fixed_subset(args.probe_train_jets, len(probe_train_ds), seed=123)
-        val_idxs   = make_fixed_subset(args.probe_val_jets,   len(probe_val_ds),   seed=456)
+        train_idxs = make_stratified_subset(probe_train_ds, args.probe_train_jets, seed=123)
+        val_idxs   = make_stratified_subset(probe_val_ds,   args.probe_val_jets,   seed=456)
+        
+        ys = [int(probe_val_ds[i][-1]) for i in val_idxs[:2000]]
+        logger.info(f"[probe check] val subset: pos={sum(ys)} neg={len(ys)-sum(ys)}")
 
         probe_train_loader = DataLoader(
             Subset(probe_train_ds, train_idxs),
