@@ -615,6 +615,8 @@ def main(rank, world_size, args):
 
             logger.info(f"[probe] epoch={epoch+1} acc={acc:.4f} auc={auc:.4f} imtafe={imtafe:.2f}")
             return acc, auc, imtafe
+    if args.probe and world_size > 1:
+        dist.barrier()
 
     losses_train, mse_losses_train, var_losses_train, cov_losses_train = [], [], [], []
     losses_val,   mse_losses_val,   var_losses_val,   cov_losses_val   = [], [], [], []
