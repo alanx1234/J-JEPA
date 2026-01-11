@@ -64,9 +64,9 @@ def load_data(args, dataset_path, tag=None, max_jets = None):
             num_jets = max_jets
     else:
         num_jets = 100_000
-    dataset = ParticleDataset(dataset_path, return_labels=True, num_jets=num_jets, compute_subjets = False)
+    dataset = ParticleDataset(dataset_path, return_labels=True, num_jets=num_jets, compute_subjets = False, shuffle_files_each_epoch=False)
     stats = dataset.stats
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, collate_fn = collate_drop_subjets, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, num_workers = 2, pin_memory=True, persistent_workers=True, collate_fn = collate_drop_subjets, shuffle=True)
     return dataloader, stats
 
 
