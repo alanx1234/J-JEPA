@@ -318,7 +318,9 @@ class ParticleDataset(Dataset):
                         qcd = vec[JETCLASS_QCD_IDX]
                         labels = torch.tensor(1 if tb == 1 else 0, dtype=torch.long)
                     else:
-                        labels = torch.from_numpy(f['labels'][true_idx]).long()
+                        lab = f["labels"][true_idx]
+                        labels = torch.tensor(int(lab), dtype=torch.long) if np.isscalar(lab) or getattr(lab, "ndim", 0) == 0 else torch.from_numpy(lab).long()
+
                 else:
                     labels = None
                 log_e = elog * self.std_log_e + self.mean_log_e
