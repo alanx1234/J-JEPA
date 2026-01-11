@@ -485,7 +485,9 @@ def main(rank, world_size, args):
     logger.info(f"Train dataset size: {train_dataset_size}")
     logger.info(f"Val dataset size:   {val_dataset_size}")
 
-        
+    if world_size > 1:
+        dist.barrier()
+
     if args.probe and rank == 0:
         probe_train_ds = ParticleDataset(
             args.data_path,
@@ -919,18 +921,21 @@ def main(rank, world_size, args):
             if options.var_loss_weight > 0:
                 np.save(os.path.join(args.output_dir, "train_var_losses.npy"), var_losses_train)
                 np.save(os.path.join(args.output_dir, "val_var_losses.npy"), var_losses_val)
+        if world_size > 1:
+            dist.barrier()
 
-            if args.probe and ((epoch + 1) % args.probe_every == 0):
-                probe_acc, probe_auc, probe_imtafe = run_probe(epoch)
+        if args.probe and rank == 0 and ((epoch + 1) % args.probe_every == 0):
+            probe_acc, probe_auc, probe_imtafe = run_probe(epoch)
 
-                probe_path = os.path.join(args.output_dir, "probe_log.txt")
-                new_file = not os.path.exists(probe_path)
+            probe_path = os.path.join(args.output_dir, "probe_log.txt")
+            new_file = not os.path.exists(probe_path)
 
-                with open(probe_path, "a") as f:
-                    if new_file:
-                        f.write("epoch\tacc\tauc\timtafe\n")
-                    f.write(f"{epoch+1}\t{probe_acc:.6f}\t{probe_auc:.6f}\t{probe_imtafe:.6f}\n")
-
+            with open(probe_path, "a") as f:
+                if new_file:
+                    f.write("epoch\tacc\tauc\timtafe\n")
+                f.write(f"{epoch+1}\t{probe_acc:.6f}\t{probe_auc:.6f}\t{probe_imtafe:.6f}\n")
+        if world_size > 1:
+            dist.barrier()
 
 
         epoch_end_time = time.time()
