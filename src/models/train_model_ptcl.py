@@ -20,6 +20,7 @@ import torch.distributed as dist
 import time
 import random
 import itertools
+import h5py
 
 import torch.cuda as cuda
 
@@ -179,36 +180,51 @@ def collate_probe_fn(batch):
     return p_spatial, p4, mask, subjets, labels
 
 
-def make_stratified_subset(ds, n_total, seed=123):
-    n_pos = n_total // 2
-    n_neg = n_total - n_pos
+JETCLASS_QCD_IDX = 0
+JETCLASS_TBQQ_IDX = 8
+
+def balanced_idxs(ds, n_each=25_000, seed=123):
+    import numpy as np
+    import h5py
+
     rng = np.random.RandomState(seed)
+    pos_global, neg_global = [], []
 
-    pos, neg = [], []
-    seen = set()
-    tries = 0
-    max_tries = 2_000_000
+    for file_idx, fn in enumerate(ds.files):
+        idxs = ds.valid_indices_per_file[file_idx]
+        if idxs is None:
+            with h5py.File(fn, "r") as f:
+                idxs = np.arange(f["labels"].shape[0], dtype=np.int64)
 
-    while (len(pos) < n_pos or len(neg) < n_neg) and tries < max_tries:
-        i = int(rng.randint(0, len(ds)))
-        tries += 1
-        if i in seen:
-            continue
-        seen.add(i)
+        with h5py.File(fn, "r") as f:
+            labs = f["labels"][idxs]
 
-        *_, y = ds[i]
-        y = int(y)
-        if y == 1 and len(pos) < n_pos:
-            pos.append(i)
-        elif y == 0 and len(neg) < n_neg:
-            neg.append(i)
+        if getattr(labs, "ndim", 0) == 1:
+            tb  = (labs == JETCLASS_TBQQ_IDX)
+            qcd = (labs == JETCLASS_QCD_IDX)
+        else:
+            tb  = (labs[:, JETCLASS_TBQQ_IDX] == 1)
+            qcd = (labs[:, JETCLASS_QCD_IDX] == 1)
 
-    if len(pos) < n_pos or len(neg) < n_neg:
-        raise RuntimeError(f"Could not stratify: pos={len(pos)} neg={len(neg)} (len(ds)={len(ds)})")
+        base  = int(ds.cum_lengths[file_idx])
+        local = np.arange(len(idxs), dtype=np.int64)
 
-    idxs = pos + neg
-    rng.shuffle(idxs)
-    return idxs
+        pos_global.append(base + local[tb])
+        neg_global.append(base + local[qcd])
+
+    pos_global = np.concatenate(pos_global)
+    neg_global = np.concatenate(neg_global)
+
+    if len(pos_global) < n_each or len(neg_global) < n_each:
+        raise RuntimeError(f"Not enough examples: pos={len(pos_global)} neg={len(neg_global)} need={n_each}")
+
+    pos = rng.choice(pos_global, size=n_each, replace=False)
+    neg = rng.choice(neg_global, size=n_each, replace=False)
+
+    out = np.concatenate([pos, neg])
+    rng.shuffle(out)
+    return out.tolist()
+
 
 def ddp_setup_if_needed():
     if "LOCAL_RANK" in os.environ:
@@ -509,12 +525,8 @@ def main(rank, world_size, args):
         )
 
         if "100%" in args.data_path:
-            train_idxs = make_stratified_subset(
-                probe_train_ds, args.probe_train_jets, seed=123
-            )
-            val_idxs = make_stratified_subset(
-                probe_val_ds, args.probe_val_jets, seed=456
-            )
+            train_idxs = balanced_idxs(probe_train_ds, n_each=args.probe_train_jets // 2, seed=123)
+            val_idxs   = balanced_idxs(probe_val_ds,   n_each=args.probe_val_jets   // 2, seed=456)
         else:
             train_idxs = make_fixed_subset(
                 args.probe_train_jets, len(probe_train_ds), seed=123
