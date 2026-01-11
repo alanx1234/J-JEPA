@@ -28,7 +28,7 @@ class ParticleDataset(Dataset):
         num_jets=None,
         return_labels=False,
         label_mode="auto", # which configuration to use
-        cache_size_gb=0.0,
+        cache_size_gb=32.0,
         size_multiplier=1.0,
         compute_subjets=False,
         base_seed=42,
