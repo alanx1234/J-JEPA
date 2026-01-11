@@ -508,8 +508,20 @@ def main(rank, world_size, args):
             shuffle_files_each_epoch=False,
         )
 
-        train_idxs = make_stratified_subset(probe_train_ds, args.probe_train_jets, seed=123)
-        val_idxs   = make_stratified_subset(probe_val_ds,   args.probe_val_jets,   seed=456)
+        if "100%" in args.data_path:
+            train_idxs = make_stratified_subset(
+                probe_train_ds, args.probe_train_jets, seed=123
+            )
+            val_idxs = make_stratified_subset(
+                probe_val_ds, args.probe_val_jets, seed=456
+            )
+        else:
+            train_idxs = make_fixed_subset(
+                args.probe_train_jets, len(probe_train_ds), seed=123
+            )
+            val_idxs = make_fixed_subset(
+                args.probe_val_jets, len(probe_val_ds), seed=456
+            )
         
         ys = [int(probe_val_ds[i][-1]) for i in val_idxs[:2000]]
         logger.info(f"[probe check] val subset: pos={sum(ys)} neg={len(ys)-sum(ys)}")
