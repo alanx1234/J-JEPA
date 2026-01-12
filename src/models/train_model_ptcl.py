@@ -360,12 +360,14 @@ def main(rank, world_size, args):
         dist.init_process_group(backend="nccl", init_method="env://")
 
     out_dir = args.output_dir
+    is_resuming = args.load_checkpoint is not None
+
     if os.path.isdir(out_dir):
-        contents = os.listdir(out_dir)
-        non_log_files = [file for file in contents if file.endswith(".pth")]
-        if non_log_files:
+        has_pth = any(f.endswith(".pth") for f in os.listdir(out_dir))
+        if has_pth and not is_resuming:
             sys.exit(
-                "ERROR: experiment already exists and contains files other than log files; don't want to overwrite it by mistake"
+                "ERROR: output_dir already has checkpoints. "
+                "Pass --load_checkpoint to resume or use a new --output_dir."
             )
     os.makedirs(out_dir, exist_ok=True)
 
@@ -417,11 +419,17 @@ def main(rank, world_size, args):
 
     logger.info(model)
 
-    checkpoint = {}
+    start_epoch = 0
+    checkpoint = None
+
     if args.load_checkpoint and Path(args.load_checkpoint).is_file():
         checkpoint = torch.load(args.load_checkpoint, map_location=device)
-        model.load_state_dict(checkpoint["model"])
+        model.load_state_dict(checkpoint["model"], strict = True)
         logger.info(f"Loaded model from {args.load_checkpoint}")
+
+        start_epoch = int(checkpoint.get("epoch", -1)) + 1
+        logger.info(f"Resuming at epoch {start_epoch}")
+    options.start_epochs = start_epoch
 
     param_groups = [
         {
@@ -469,8 +477,13 @@ def main(rank, world_size, args):
         weight_decay=options.weight_decay,
         eps=options.eps,
     )
-    if checkpoint:
+    if checkpoint is not None and "optimizer" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer"])
+        # move optimizer state tensors onto GPU
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(device, non_blocking=True)
         logger.info(f"Loaded optimizer state from {args.load_checkpoint}")
 
     if world_size > 1:
@@ -492,6 +505,9 @@ def main(rank, world_size, args):
     total_steps = options.num_epochs * steps_per_epoch
 
     start_global_step = options.start_epochs * steps_per_epoch
+
+    for _ in range(start_global_step):
+        _ = next(momentum_scheduler)
 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
@@ -634,7 +650,7 @@ def main(rank, world_size, args):
     losses_val,   mse_losses_val,   var_losses_val,   cov_losses_val   = [], [], [], []
     lowest_val_loss = np.inf
 
-    for epoch in range(options.start_epochs, options.num_epochs):
+    for epoch in range(start_epoch, options.num_epochs):
         logger.info("Epoch %d" % (epoch + 1))
         logger.info("lr: %f" % scheduler.get_last_lr()[0])
         epoch_start_time = time.time()
