@@ -343,6 +343,22 @@ def seed_everything(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+def read_logged_probe_epochs(probe_path: str):
+    if not os.path.exists(probe_path):
+        return set()
+    logged = set()
+    with open(probe_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("epoch"):
+                continue
+            parts = line.split()
+            try:
+                e = int(parts[0])
+                logged.add(e)
+            except Exception:
+                pass
+    return logged
 
 @torch.no_grad()
 def encode_batch(encoder, p4, p4_spatial, particle_mask, stats, use_parT: bool):
@@ -430,6 +446,9 @@ def main(rank, world_size, args):
         start_epoch = int(checkpoint.get("epoch", -1)) + 1
         logger.info(f"Resuming at epoch {start_epoch}")
     options.start_epochs = start_epoch
+
+    probe_path = os.path.join(args.output_dir, "probe_log.txt")
+    logged_probe_epochs = read_logged_probe_epochs(probe_path)
 
     param_groups = [
         {
@@ -649,6 +668,27 @@ def main(rank, world_size, args):
     losses_train, mse_losses_train, var_losses_train, cov_losses_train = [], [], [], []
     losses_val,   mse_losses_val,   var_losses_val,   cov_losses_val   = [], [], [], []
     lowest_val_loss = np.inf
+
+    if checkpoint is not None:
+        def _extend_if_exists(fname, arr):
+            p = os.path.join(args.output_dir, fname)
+            if os.path.exists(p):
+                arr.extend(np.load(p).tolist())
+
+        _extend_if_exists("train_losses.npy", losses_train)
+        _extend_if_exists("val_losses.npy",   losses_val)
+
+        _extend_if_exists("train_mse_losses.npy", mse_losses_train)
+        _extend_if_exists("val_mse_losses.npy",   mse_losses_val)
+
+        _extend_if_exists("train_cov_losses.npy", cov_losses_train)
+        _extend_if_exists("val_cov_losses.npy",   cov_losses_val)
+
+        _extend_if_exists("train_var_losses.npy", var_losses_train)
+        _extend_if_exists("val_var_losses.npy",   var_losses_val)
+    
+    if len(losses_val) > 0:
+        lowest_val_loss = float(np.min(losses_val))
 
     for epoch in range(start_epoch, options.num_epochs):
         logger.info("Epoch %d" % (epoch + 1))
@@ -967,15 +1007,20 @@ def main(rank, world_size, args):
             dist.barrier()
 
         if args.probe and rank == 0 and ((epoch + 1) % args.probe_every == 0):
-            probe_acc, probe_auc, probe_imtafe = run_probe(epoch)
+            this_epoch_num = epoch + 1
 
-            probe_path = os.path.join(args.output_dir, "probe_log.txt")
-            new_file = not os.path.exists(probe_path)
+            if this_epoch_num in logged_probe_epochs:
+                logger.info(f"[probe] epoch={this_epoch_num} already in probe_log.txt, skipping")
+            else:
+                probe_acc, probe_auc, probe_imtafe = run_probe(epoch)
 
-            with open(probe_path, "a") as f:
-                if new_file:
-                    f.write("epoch\tacc\tauc\timtafe\n")
-                f.write(f"{epoch+1}\t{probe_acc:.6f}\t{probe_auc:.6f}\t{probe_imtafe:.6f}\n")
+                new_file = not os.path.exists(probe_path)
+                with open(probe_path, "a") as f:
+                    if new_file:
+                        f.write("epoch\tacc\tauc\timtafe\n")
+                    f.write(f"{this_epoch_num}\t{probe_acc:.6f}\t{probe_auc:.6f}\t{probe_imtafe:.6f}\n")
+
+                logged_probe_epochs.add(this_epoch_num)
         if world_size > 1:
             dist.barrier()
 
